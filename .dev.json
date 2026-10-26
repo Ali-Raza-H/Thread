@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "name": "Thread",
+  "display_name": "Thread",
+  "description": "A reverse engenieering tool for python projects",
+  "type": "python",
+  "status": "active",
+  "ignored": false,
+  "environment": {
+    "type": "python-venv",
+    "mode": "local",
+    "path": ".venv"
+  },
+  "commands": {
+    "run": "threadtrace tui lifeOS",
+    "install": "uv pip install -e ."
+  },
+  "git": {
+    "enabled": false
+  },
+  "tags": [
+    "tool",
+    "cli",
+    "tui",
+    "python"
+  ],
+  "created_at": "2026-10-26",
+  "updated_at": "2026-10-26"
+}

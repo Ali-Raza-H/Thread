@@ -1,0 +1,155 @@
+Metadata-Version: 2.4
+Name: thread-trace
+Version: 0.7.0a1
+Summary: Local-first static analysis for Python projects
+Author: Traceback
+License: MIT
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: prompt_toolkit>=3.0.43
+
+# Thread
+
+Thread 0.6.0-alpha.1 is a terminal-first, local static analysis tool for Python projects. It reads source with Python's AST parser and never imports or runs the project being analysed.
+
+See the complete [user manual](USER_MANUAL.md) for installation, every command,
+the terminal explorer, local Ollama explanations, runtime-tracing safety, and
+troubleshooting.
+
+It reconstructs evidence-backed entry points, architecture components, static
+call paths, direct argument/return flow, and external resource boundaries. A
+relationship is always labelled `confirmed`, `high`, `possible`, or `unknown`;
+Thread does not turn a dynamic Python guess into a fact.
+
+## Quick start
+
+```console
+threadtrace project add ~/code/example
+threadtrace scan example
+threadtrace modules example
+threadtrace functions example
+threadtrace deps example app.core --depth 2
+threadtrace diagnostics example
+threadtrace overview example --format markdown
+threadtrace guide example
+threadtrace entrypoints example
+threadtrace architecture example --format mermaid
+threadtrace path example "POST /users"
+threadtrace resources example --kind database
+threadtrace impact example app.services.users.register
+threadtrace dataflow example app.routes.create_user --to database
+threadtrace walk example "POST /users"
+threadtrace map example "POST /users"
+threadtrace findings example
+```
+
+Use `--format json` with query commands for machine-readable output. Scans are explicit; query commands use the most recently completed scan.
+
+## Terminal explorer
+
+Use `explain` for a concise evidence-grounded description and `compare` to
+compare two completed scan IDs. JSON is the stable integration format;
+architecture also exports Mermaid and DOT.
+
+Runtime correlation is optional and never happens during a scan or TUI launch.
+It runs only a command you explicitly provide, for example
+`threadtrace trace example --yes-run -- python -m app`; it is bounded by a
+timeout/output cap but is **not** a security sandbox. Captured runtime events
+are stored separately and labelled `runtime`.
+
+## Optional AI explanations
+
+Thread can ask a small local Ollama model to explain its *stored evidence*;
+it never automatically sends repository files or runs AI during scans. The
+response is labelled AI-assisted and instructed to cite source locations.
+
+```console
+# Local Ollama (default model: llama3.2)
+threadtrace explain example app.routes.create_user --ai
+threadtrace explain example app.routes.create_user --ai --ai-model qwen2.5:7b
+```
+
+Set `THREADTRACE_OLLAMA_ENDPOINT` to override Ollama's local URL. In the
+explorer, `:ai` requests an explanation for the selected result using Ollama.
+
+## Library context
+
+`threadtrace libraries PROJECT` now includes a concise local description plus
+the exact project files and import sites that use each library.
+
+Open a keyboard-first, full-screen explorer for a completed scan:
+
+```console
+threadtrace tui example
+```
+
+It opens in **Guided** mode. Pick a suggested starting point with `1`–`9`, then
+use `w` to follow one supported path, `m` to see the files involved, and `c` to
+open code. `g` returns to Guided mode; `o`, `e`, `a`, `u`, `f`, `d`, `l`, and `x`
+open the more technical views. Press `/` to search, `:` for the command palette,
+`r` to rescan, and `q` to quit. The explorer is built with `prompt_toolkit`, not
+Textual.
+
+Press `p` for the **File Graph**: files are nodes and labelled edges represent
+imports or cross-file calls. In the graph, press `t` to switch to the **Code
+Graph**, where functions/classes are nodes and links show calls, class-method
+membership, and resolvable inheritance. Graphs stay centred on the selected
+node; use `j`/`k` to follow links, `+`/`-` to change the hop scope, `[`/`]` to
+filter confidence, and `,`/`.` to filter relationship type.
+
+## Step-by-step runtime dashboard
+
+For a controlled view of one real execution, give Thread the exact command that
+starts the project:
+
+```console
+threadtrace runtime example -- python -m app.cli import-data sample.csv
+```
+
+The dashboard opens before the command runs. Press `s` to start paused, `n` to
+advance one project-level execution event, or `c` to continue. It shows calls,
+source lines, safe parameter/variable/return summaries, exceptions, and bounded
+process output. Runtime mode executes code and is not a security sandbox.
+
+## Running-process discovery
+
+On Linux, Thread can safely discover Python interpreters owned by your current
+user:
+
+```console
+threadtrace processes --format json
+threadtrace process
+threadtrace process 12345
+```
+
+`process` opens a confirmation screen with the PID, command, inferred project
+root, detected venv, and descendants. From there you can scan the selected
+project normally, or explicitly stop its process tree and restart the exact
+command under the Runtime dashboard. Thread does not attach to or inject into
+an already-running interpreter in this release.
+
+## Live observation for interactive TUIs
+
+For an interactive Python TUI, use Runtime Host in the terminal that should own
+the program, then open a passive listener in a second terminal:
+
+```console
+# Terminal A — ARIA retains its real TUI and input/output.
+threadtrace runtime-host ARIA -- dev run aria
+
+# Terminal B — Thread follows it without pausing or hijacking ARIA.
+threadtrace runtime-listen ARIA
+```
+
+The host publishes safe project-root trace events through a private local
+session. The listener is read-only, so ARIA continues normally while Thread
+shows live calls, source lines, variable summaries, returns, and exceptions.
+
+## Scope and limits
+
+Thread reports static evidence: definitions, imports, syntactic calls, class relationships, and local data movement. Python can select values and call targets dynamically, so uncertain calls are shown as ambiguous or unresolved rather than guessed. A data-flow view is intra-function and does not claim to track values through arbitrary runtime behaviour.
+

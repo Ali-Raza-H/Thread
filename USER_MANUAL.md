@@ -482,6 +482,7 @@ The dashboard opens without executing it. Controls are:
 | `p` | Request a pause at the next traced event. |
 | `b` | Toggle a breakpoint at the selected source line. A breakpoint pauses a continued run before the next matching trace event. |
 | `f` | Focus the selected asyncio task. Other task events are hidden and never pause the dashboard; press it again to show all lanes. |
+| `i` | Focus **Program input**. Type one line and press Enter to send it to a line-oriented child prompt such as `input()`; press Esc to cancel the entry. |
 | `j`/`k` or Up/Down | Inspect an earlier/later recorded event. |
 | `Tab` | Move between the event timeline and the scrollable data/source inspector. |
 | `q` | Stop the controlled subprocess and close the dashboard. |
@@ -506,6 +507,11 @@ needs scheduler-level coordination to be correct.
 Runtime mode can still execute untrusted code. It is not a sandbox, does not
 isolate network/filesystem access, and cannot reliably observe native code,
 other processes, or code that never enters a project-root Python frame.
+
+For a full-screen or key-by-key interactive application, use `runtime-host` in
+one terminal and `runtime-listen` in another. Direct Runtime's Program input is
+intentionally limited to complete input lines so its own dashboard remains in
+control of the terminal.
 
 ### Running-process discovery and restart debugging
 
@@ -645,8 +651,9 @@ Thread is designed to be conservative.
   database write, request, or subprocess call succeeded at runtime.
 - Ollama explanations are optional interpretations of recorded facts, not an
   authority over the evidence.
-- Runtime traces cover Python frames under the project root and may be empty if
-  the command bypasses Python startup hooks or runs only external/native code.
+- Runtime traces cover application Python frames under the project root. Python
+  virtual environments nested inside that root are excluded. Traces may be empty
+  if the command bypasses Python startup hooks or runs only external/native code.
 
 For reliable conclusions, start from `overview`, follow a path, and open the
 source evidence for the claims you care about.

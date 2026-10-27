@@ -257,6 +257,88 @@ class EngineTests(unittest.TestCase):
         finally:
             session.close()
 
+    def test_controlled_runtime_session_preserves_environment_and_accepts_input(self) -> None:
+        from threadtrace.runtime.session import RuntimeSession
+
+        (self.root / "input_runner.py").write_text(
+            "import os\n"
+            "print('PROMPT>', flush=True)\n"
+            "answer = input()\n"
+            "print(f'ANSWER={answer}; VALUE={os.getenv(\"THREADTRACE_TEST_VALUE\")}', flush=True)\n"
+        )
+        session = RuntimeSession(
+            self.root, [sys.executable, "input_runner.py"], timeout=3, output_cap=10_000,
+            runtime_environment={"THREADTRACE_TEST_VALUE": "available"},
+        )
+        try:
+            session.continue_run()
+            for _ in range(200):
+                if "PROMPT>" in session.result()["stdout"]:
+                    break
+                time.sleep(0.025)
+            self.assertIn("PROMPT>", session.result()["stdout"])
+            self.assertTrue(session.send_input("Ada"))
+            for _ in range(200):
+                if session.finished:
+                    break
+                time.sleep(0.025)
+            self.assertTrue(session.finished)
+            self.assertIn("ANSWER=Ada; VALUE=available", session.result()["stdout"])
+        finally:
+            session.close()
+
+    def test_controlled_runtime_session_preserves_dotenv_caller_lookup(self) -> None:
+        """A tracer must not make python-dotenv fall back to the project cwd."""
+        from threadtrace.runtime.session import RuntimeSession
+
+        dotenv = self.root / "dotenv"
+        dotenv.mkdir()
+        (dotenv / "__init__.py").write_text("from .main import load_dotenv\n")
+        (dotenv / "main.py").write_text(
+            "import os\n"
+            "def find_dotenv(filename='.env', raise_error_if_not_found=False, usecwd=False):\n"
+            "    return ''\n"
+            "def load_dotenv():\n"
+            "    path = find_dotenv()\n"
+            "    if not path:\n"
+            "        return False\n"
+            "    for line in open(path, encoding='utf-8'):\n"
+            "        key, value = line.strip().split('=', 1)\n"
+            "        os.environ.setdefault(key, value)\n"
+            "    return True\n"
+        )
+        backend = self.root / "backend"
+        backend.mkdir()
+        (backend / "__init__.py").write_text("")
+        (backend / ".env").write_text("NESTED_VALUE=available\n")
+        (backend / "settings.py").write_text(
+            "import os\n"
+            "from dotenv import load_dotenv\n"
+            "load_dotenv()\n"
+            "value = os.getenv('NESTED_VALUE')\n"
+        )
+        (self.root / "dotenv_runner.py").write_text(
+            "from backend import settings\n"
+            "print(settings.value, flush=True)\n"
+        )
+        session = RuntimeSession(
+            self.root, [sys.executable, "dotenv_runner.py"], timeout=3, output_cap=10_000,
+            # sitecustomize is imported before Python adds the script's
+            # directory to sys.path; CIEL's real dotenv is installed in its
+            # virtual environment and is therefore already importable here.
+            runtime_environment={"PYTHONPATH": str(self.root)},
+        )
+        try:
+            session.continue_run()
+            for _ in range(80):
+                if session.finished:
+                    break
+                time.sleep(0.025)
+            self.assertTrue(session.finished)
+            self.assertEqual(session.result()["stdout"].strip(), "available")
+        finally:
+            session.close()
+
     def test_runtime_breakpoint_pauses_a_continued_project_run(self) -> None:
         from threadtrace.runtime.session import RuntimeSession
 

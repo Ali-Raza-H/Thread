@@ -111,9 +111,12 @@ threadtrace runtime example -- python -m app.cli import-data sample.csv
 ```
 
 The dashboard opens before the command runs. Press `s` to start paused, `n` to
-advance one project-level execution event, or `c` to continue. It shows calls,
-source lines, safe parameter/variable/return summaries, exceptions, and bounded
-process output. Runtime mode executes code and is not a security sandbox.
+advance one project-level execution event, or `c` to continue. If a
+line-oriented program calls `input()`, press `i`, type into **Program input**,
+and press Enter to send a line without handing over the dashboard terminal. It
+shows calls, source lines, safe parameter/variable/return summaries, exceptions,
+and bounded process output. Runtime mode executes code and is not a security
+sandbox.
 
 ## Running-process discovery
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -62,9 +63,13 @@ class RuntimeSession:
         (self.directory / "sitecustomize.py").write_text(_trace_source(), encoding="utf-8")
         self._write_config()
         self._send("paused")
-        environment = {key: value for key, value in os.environ.items() if key in {"PATH", "SYSTEMROOT", "WINDIR", "TMPDIR", "TEMP", "TMP"}}
-        environment.update({key: value for key, value in self.runtime_environment.items() if key in {"PATH", "VIRTUAL_ENV", "CONDA_PREFIX"}})
-        inherited_path = self.runtime_environment.get("PYTHONPATH", os.environ.get("PYTHONPATH", ""))
+        # A runtime session should start as closely as possible to a normal
+        # invocation.  In particular, projects commonly need HOME, locale,
+        # cloud credentials, or variables loaded by a wrapper such as `dev`.
+        # Thread only adds its own namespaced tracing variables below.
+        environment = os.environ.copy()
+        environment.update(self.runtime_environment)
+        inherited_path = environment.get("PYTHONPATH", "")
         environment["PYTHONPATH"] = os.pathsep.join(filter(None, [str(self.directory), inherited_path]))
         environment["THREADTRACE_RUNTIME_LOG"] = str(self.log_path)
         environment["THREADTRACE_RUNTIME_CONTROL"] = str(self.control_path)
@@ -72,13 +77,37 @@ class RuntimeSession:
         environment["THREADTRACE_RUNTIME_ROOT"] = str(self.root)
         environment["THREADTRACE_RUNTIME_MAX_EVENTS"] = str(self.event_cap)
         self.process = subprocess.Popen(
-            self.command, cwd=self.root, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            self.command, cwd=self.root, env=environment,
+            # The dashboard owns the real terminal.  A private pipe lets the
+            # input panel send complete lines to input() without two programs
+            # competing to read the same terminal in raw mode.
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            # `dev run` and similar launchers can create descendants. Put the
+            # controlled execution in its own group so q/Ctrl-C can reliably
+            # stop all of them instead of leaving the terminal wedged.
+            start_new_session=os.name == "posix",
         )
         self.started_at = time.monotonic()
         self.mode = "paused"
-        assert self.process.stdout is not None and self.process.stderr is not None
+        assert self.process.stdin is not None and self.process.stdout is not None and self.process.stderr is not None
         threading.Thread(target=self._drain, args=(self.process.stdout, self._stdout), daemon=True).start()
         threading.Thread(target=self._drain, args=(self.process.stderr, self._stderr), daemon=True).start()
+
+    def send_input(self, text: str) -> bool:
+        """Send one line of user input to the controlled child process.
+
+        Direct Runtime intentionally does not share its terminal with the
+        child.  This keeps the dashboard responsive while still supporting
+        line-oriented prompts such as ``input()``.
+        """
+        if not self.process or self.finished or not self.process.stdin:
+            return False
+        try:
+            self.process.stdin.write((text + "\n").encode())
+            self.process.stdin.flush()
+            return True
+        except (BrokenPipeError, OSError):
+            return False
 
     def step(self) -> None:
         self.start()
@@ -149,18 +178,18 @@ class RuntimeSession:
 
     def stop(self) -> None:
         if self.process and not self.finished:
-            self.process.terminate()
+            self._signal_group(signal.SIGTERM)
             try:
                 self.process.wait(timeout=1)
             except subprocess.TimeoutExpired:
-                self.process.kill()
+                self._signal_group(signal.SIGKILL)
                 self.process.wait(timeout=1)
             self.mode = "stopped"
 
     def poll(self) -> list[dict[str, Any]]:
         if self.process and self.mode == "continue" and not self.finished and self.started_at and time.monotonic() - self.started_at > self.timeout:
             self.timed_out = True
-            self.process.terminate()
+            self._signal_group(signal.SIGTERM)
         if not self.log_path.exists():
             return []
         try:
@@ -211,11 +240,27 @@ class RuntimeSession:
     def close(self) -> None:
         self.stop()
         if self.process:
+            if self.process.stdin:
+                self.process.stdin.close()
             if self.process.stdout:
                 self.process.stdout.close()
             if self.process.stderr:
                 self.process.stderr.close()
         self._directory.cleanup()
+
+    def _signal_group(self, signal_number: int) -> None:
+        """Signal the controlled command and launcher descendants together."""
+        assert self.process is not None
+        if os.name == "posix":
+            try:
+                os.killpg(self.process.pid, signal_number)
+                return
+            except ProcessLookupError:
+                return
+        if signal_number == signal.SIGKILL:
+            self.process.kill()
+        else:
+            self.process.terminate()
 
     def _send(self, action: str, **details: Any) -> None:
         self._sequence += 1
@@ -238,7 +283,11 @@ class RuntimeSession:
         os.replace(temporary, self.config_path)
 
     def _drain(self, stream: Any, destination: bytearray) -> None:
-        while chunk := stream.read(4096):
+        # BufferedReader.read(4096) is allowed to wait until the buffer is
+        # full.  read1 returns a flushed prompt promptly, which is important
+        # when the program is waiting for a response in Program input.
+        reader = getattr(stream, "read1", stream.read)
+        while chunk := reader(4096):
             with self._output_lock:
                 remaining = self.output_cap - len(destination)
                 if remaining > 0:
@@ -258,6 +307,63 @@ try:
     import asyncio
 except Exception:
     asyncio = None
+
+def _preserve_dotenv_lookup():
+    """Keep python-dotenv's normal caller-file lookup under this tracer.
+
+    python-dotenv treats any sys.settrace() hook as a debugger and then only
+    looks for .env in the current working directory. A runtime tracer is not a
+    user debugger, and that change makes a normal layout such as
+    ``backend/.env`` invisible when a command starts from the project root.
+    Limit the compatibility adjustment to find_dotenv itself; explicit
+    ``usecwd=True`` calls retain their requested behaviour.
+    """
+    try:
+        import dotenv.main as _threadtrace_dotenv
+    except ImportError:
+        return
+    original = _threadtrace_dotenv.find_dotenv
+    if getattr(original, "_threadtrace_preserves_lookup", False):
+        return
+    def find_dotenv(filename=".env", raise_error_if_not_found=False, usecwd=False):
+        # This mirrors python-dotenv's normal (non-debugger) lookup. Calling
+        # the original function from a wrapper is not sufficient: its frame
+        # walk would stop at this injected sitecustomize.py file.
+        def interactive():
+            if hasattr(sys, "ps1") or hasattr(sys, "ps2"):
+                return True
+            try:
+                main = __import__("__main__", None, None, fromlist=["__file__"])
+            except ModuleNotFoundError:
+                return False
+            return not hasattr(main, "__file__")
+        if usecwd or interactive() or getattr(sys, "frozen", False):
+            path = os.getcwd()
+        else:
+            frame = sys._getframe()
+            dotenv_file = os.path.abspath(_threadtrace_dotenv.__file__)
+            tracer_file = os.path.abspath(__file__)
+            while frame and (
+                os.path.abspath(frame.f_code.co_filename) in (dotenv_file, tracer_file)
+                or not os.path.exists(frame.f_code.co_filename)
+            ):
+                frame = frame.f_back
+            path = os.path.dirname(os.path.abspath(frame.f_code.co_filename)) if frame else os.getcwd()
+        while True:
+            candidate = os.path.join(path, filename)
+            if os.path.isfile(candidate):
+                return candidate
+            parent = os.path.dirname(path)
+            if parent == path:
+                break
+            path = parent
+        if raise_error_if_not_found:
+            raise IOError("File not found")
+        return ""
+    find_dotenv._threadtrace_preserves_lookup = True
+    _threadtrace_dotenv.find_dotenv = find_dotenv
+
+_preserve_dotenv_lookup()
 
 _root = os.path.realpath(os.environ.get("THREADTRACE_RUNTIME_ROOT", ""))
 _log = os.environ.get("THREADTRACE_RUNTIME_LOG")
@@ -284,7 +390,22 @@ def _in_root(filename):
     try:
         if not os.path.isabs(filename):
             return False
-        return os.path.commonpath([os.path.realpath(filename), _root]) == _root
+        source = os.path.realpath(filename)
+        if os.path.commonpath([source, _root]) != _root:
+            return False
+        # A project commonly contains .venv, but its installed dependencies
+        # are not application source. Detect every nested Python environment
+        # by its standard marker so this also works for names such as env or
+        # venv and for environments created by either uv or stdlib venv.
+        directory = os.path.dirname(source)
+        while directory != _root:
+            if os.path.isfile(os.path.join(directory, "pyvenv.cfg")):
+                return False
+            parent = os.path.dirname(directory)
+            if parent == directory:
+                return False
+            directory = parent
+        return True
     except ValueError:
         return False
 

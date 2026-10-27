@@ -26,8 +26,10 @@ def run_python_trace(root: Path, command: list[str], timeout: int, output_cap: i
         trace_dir = Path(directory)
         log_path = trace_dir / "events.jsonl"
         (trace_dir / "sitecustomize.py").write_text(_profile_source(), encoding="utf-8")
-        environment = {key: value for key, value in os.environ.items() if key in {"PATH", "SYSTEMROOT", "WINDIR", "TMPDIR", "TEMP", "TMP"}}
-        inherited_path = os.environ.get("PYTHONPATH", "")
+        # Preserve the same environment as a direct invocation.  A command
+        # may rely on variables supplied by its shell, wrapper, or .env loader.
+        environment = os.environ.copy()
+        inherited_path = environment.get("PYTHONPATH", "")
         environment["PYTHONPATH"] = os.pathsep.join(filter(None, [str(trace_dir), inherited_path]))
         environment["THREADTRACE_RUNTIME_LOG"] = str(log_path)
         environment["THREADTRACE_RUNTIME_ROOT"] = str(root)

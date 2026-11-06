@@ -11,7 +11,7 @@
     "path": ".venv"
   },
   "commands": {
-    "run": "threadtrace --help",
+    "run": "kitty --hold source .venv/bin/activate",
     "install": "uv pip install -e ."
   },
   "git": {

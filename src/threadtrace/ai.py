@@ -1,4 +1,4 @@
-"""Optional evidence-only AI narration for Thread scan results.
+"""Optional evidence-only AI narration for ThreadTrace scan results.
 
 The model receives a compact, structured subset of already persisted scan
 facts. It never receives a repository path and this module never reads target
@@ -39,7 +39,7 @@ def explain(facts: dict[str, Any], model: str | None = None, endpoint: str | Non
 
 def _system_prompt() -> str:
     return (
-        "You explain Python projects from Thread static-analysis evidence. Use only supplied facts. "
+        "You explain Python projects from ThreadTrace static-analysis evidence. Use only supplied facts. "
         "Every architectural or behavioural claim must cite a source location in [path:line] form when one exists. "
         "Never invent runtime behaviour, library capabilities, or missing links. Say 'unknown' when evidence is insufficient. "
         "Be concise, practical, and return Markdown."
@@ -47,11 +47,11 @@ def _system_prompt() -> str:
 
 
 def _prompt(facts: dict[str, Any]) -> str:
-    return "Explain this Thread evidence:\n\n```json\n" + json.dumps(_bounded(facts), indent=2, default=str) + "\n```"
+    return "Explain this ThreadTrace evidence:\n\n```json\n" + json.dumps(_bounded(facts), indent=2, default=str) + "\n```"
 
 
 def _bounded(value: Any, depth: int = 0) -> Any:
-    """Cap provider input without changing the source facts held by Thread."""
+    """Cap provider input without changing the source facts held by ThreadTrace."""
     if depth > 5:
         return "<truncated>"
     if isinstance(value, str):

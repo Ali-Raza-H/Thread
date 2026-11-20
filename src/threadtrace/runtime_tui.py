@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -25,37 +26,55 @@ def _value(summary: Any) -> str:
     if not isinstance(summary, dict):
         return "<unavailable>"
     kind = str(summary.get("type", "unknown"))
+    identity = f" @{summary['object_id']}" if summary.get("object_id") else ""
+    if summary.get("cycle"):
+        return f"<cycle to {summary.get('reference') or 'parent'}>"
     if "value" in summary:
         value = summary["value"]
-        if value in ("<redacted>", "<object>"):
-            return f"{value} ({kind})"
-        return f"{value!r} ({kind})"
+        if value in ("<redacted>", "<object>", "<native/opaque object>"):
+            return f"{value} ({kind}){identity}"
+        return f"{value!r} ({kind}){identity}"
     if "preview" in summary:
         preview = summary["preview"]
         suffix = "…" if summary.get("length", 0) > len(preview) else ""
-        return f"{preview!r}{suffix} (str, length {summary.get('length', '?')})"
+        return f"{preview!r}{suffix} (str, length {summary.get('length', '?')}){identity}"
     if "length" in summary:
-        keys = summary.get("keys")
-        suffix = f", keys: {', '.join(map(str, keys))}" if isinstance(keys, list) and keys else ""
-        return f"<{kind}, length {summary['length']}{suffix}>"
-    return f"<{kind}>"
+        suffix = " (truncated)" if summary.get("truncated") else ""
+        return f"<{kind}, length {summary['length']}{suffix}>{identity}"
+    if "summary" in summary:
+        return f"<{kind}: {summary['summary']}>{identity}"
+    return f"<{kind}>{identity}"
+
+
+def _timing(item: dict[str, Any]) -> str:
+    elapsed = item.get("elapsed_seconds")
+    cpu = item.get("cpu_seconds")
+    if not isinstance(elapsed, (int, float)) or not isinstance(cpu, (int, float)):
+        return "Timing: unavailable\n"
+    return f"Timing: +{elapsed:.6f}s elapsed · {cpu:.6f}s CPU\n"
 
 
 class RuntimeApp:
     """A slow, source-focused viewer for a command the user elected to run."""
 
     def __init__(self, engine: Engine, project: str, command: list[str], timeout: int, output_cap: int,
-                 runtime_environment: dict[str, str] | None = None) -> None:
+                 runtime_environment: dict[str, str] | None = None, cwd: Path | None = None,
+                 capture_level: str = "metadata", capture_limit: int = 4096, redact: bool = True) -> None:
         self.engine = engine
         self.project_row = engine.get_project(project)
         self.project = project
-        self.session = RuntimeSession(Path(self.project_row["root_path"]), command, timeout, output_cap, runtime_environment=runtime_environment)
+        self.session = RuntimeSession(
+            Path(self.project_row["root_path"]), command, timeout, output_cap,
+            runtime_environment=runtime_environment, cwd=cwd, capture_level=capture_level,
+            capture_limit=capture_limit, redact=redact,
+        )
         self.events: list[dict[str, Any]] = []
         self.frame_events: dict[str, list[int]] = {}
         self.frame_values: dict[str, dict[str, Any]] = {}
         self.selected = 0
         self.status = "Ready. The project has not started. Press s to start paused, n to step, or c to run."
         self.recorded = False
+        self.input_mode = "program"
         self._output_size = (0, 0)
         self.events_control = FormattedTextControl(self._events_text, focusable=True, get_cursor_position=self._cursor)
         self.inspector = TextArea(text="", read_only=True, focusable=True, focus_on_click=True, wrap_lines=True, scrollbar=True)
@@ -87,6 +106,7 @@ class RuntimeApp:
             "header": "bg:#3b1f1f #fff1e6 bold", "status": "bg:#4b2c20 #fff1e6",
             "frame.border": "#9b7059", "frame.label": "#ffd2a8 bold", "selected": "bg:#875035 #ffffff bold",
             "call": "#9fd8ff", "return": "#9ee6a8", "line": "#d9d9d9", "exception": "#ffadad",
+            "resource": "#ffd580",
         })
 
     def run(self) -> None:
@@ -110,21 +130,24 @@ class RuntimeApp:
 
         @keys.add("n", filter=controls)
         @keys.add("enter", filter=controls)
+        def selected_thread() -> int | None:
+            return self.events[self.selected].get("thread_id") if self.events else None
+
         def step(event: Any) -> None:
             try:
-                self.session.step()
+                self.session.step(selected_thread())
                 self.status = "Stepping one project execution event…"
             except (OSError, ValueError) as exc:
                 self.status = f"Could not step runtime session: {exc}"
 
         @keys.add("o", filter=controls)
         def step_over(event: Any) -> None:
-            self.session.step_over()
+            self.session.step_over(selected_thread())
             self.status = "Stepping over nested calls…"
 
         @keys.add("u", filter=controls)
         def step_out(event: Any) -> None:
-            self.session.step_out()
+            self.session.step_out(selected_thread())
             self.status = "Running until the current frame returns…"
 
         @keys.add("c", filter=controls)
@@ -154,6 +177,40 @@ class RuntimeApp:
                 enabled = self.session.toggle_breakpoint(path, line)
                 relative = item.get("relative_path", path)
                 self.status = f"Breakpoint {'set' if enabled else 'cleared'} at {relative}:{line}."
+            except ValueError as exc:
+                self.status = str(exc)
+
+        @keys.add("B", filter=controls)
+        def conditional_breakpoint(event: Any) -> None:
+            if not self.events:
+                self.status = "Run to a source event first, then press B on its line."
+                return
+            self.input_mode = "condition"
+            event.app.layout.focus(self.program_input)
+            self.status = "Type a read-only breakpoint condition, then press Enter."
+
+        @keys.add("w", filter=controls)
+        def watchpoint(event: Any) -> None:
+            if not self.events:
+                self.status = "Run to a source event first, then press w on its line."
+                return
+            self.input_mode = "watch"
+            event.app.layout.focus(self.program_input)
+            self.status = "Type a read-only watch expression, then press Enter."
+
+        @keys.add("t", filter=controls)
+        def tracepoint(event: Any) -> None:
+            if not self.events:
+                self.status = "Run to a source event first, then press t on its line."
+                return
+            item = self.events[self.selected]
+            path, line = item.get("path"), item.get("line")
+            if not isinstance(path, str) or not isinstance(line, int):
+                self.status = "This event has no usable source location."
+                return
+            try:
+                self.session.add_breakpoint(path, line, kind="tracepoint")
+                self.status = f"Tracepoint set at {item.get('relative_path', path)}:{line}."
             except ValueError as exc:
                 self.status = str(exc)
 
@@ -198,15 +255,30 @@ class RuntimeApp:
             if not self.session.started or self.session.finished:
                 self.status = "Start the runtime process before sending program input."
                 return
+            self.input_mode = "program"
             event.app.layout.focus(self.program_input)
             self.status = "Type one line for the program, then press Enter to send it."
 
         @keys.add("enter", filter=has_focus(self.program_input))
         def send_program_input(event: Any) -> None:
             value = self.program_input.text
+            self.program_input.text = ""
+            event.app.layout.focus(self.events_control)
+            if self.input_mode != "program":
+                item = self.events[self.selected] if self.events else {}
+                path, line = item.get("path"), item.get("line")
+                if not isinstance(path, str) or not isinstance(line, int):
+                    self.status = "This event has no usable source location."
+                else:
+                    kind = "watchpoint" if self.input_mode == "watch" else "breakpoint"
+                    try:
+                        self.session.add_breakpoint(path, line, condition=value, kind=kind)
+                        self.status = f"{kind.title()} set at {item.get('relative_path', path)}:{line}."
+                    except ValueError as exc:
+                        self.status = str(exc)
+                self.input_mode = "program"
+                return
             if self.session.send_input(value):
-                self.program_input.text = ""
-                event.app.layout.focus(self.events_control)
                 self.status = "Sent one input line to the runtime process."
             else:
                 self.status = "Could not send input: the runtime process is not running."
@@ -214,8 +286,9 @@ class RuntimeApp:
         @keys.add("escape", filter=has_focus(self.program_input))
         def cancel_program_input(event: Any) -> None:
             self.program_input.text = ""
+            self.input_mode = "program"
             event.app.layout.focus(self.events_control)
-            self.status = "Program input cancelled."
+            self.status = "Input cancelled."
 
         @keys.add("q", filter=controls)
         @keys.add("c-c", filter=controls)
@@ -258,13 +331,13 @@ class RuntimeApp:
             self.engine.record_runtime(self.project, self.session.result())
             self.recorded = True
         except ThreadError as exc:
-            self.status = f"Runtime ended, but Thread could not store the session: {exc}"
+            self.status = f"Runtime ended, but ThreadTrace could not store the session: {exc}"
 
     def _header_text(self) -> StyleAndTextTuples:
         state = "not started" if not self.session.started else "finished" if self.session.finished else "paused / running"
         points = len(self.session.breakpoints)
         focus = "all lanes" if not self.session.focused_task_id else "focused task"
-        return [("class:title", f" Thread Runtime  /  {self.project_row['name']}  /  {state}"), ("", f"     {focus} · s start · n into · o over · u out · c continue · p pause · i program input · b breakpoint ({points}) · f task focus · j/k inspect · q stop/quit")]
+        return [("class:title", f" ThreadTrace Runtime  /  {self.project_row['name']}  /  {state}"), ("", f"     {focus} · s start · n into · o over · u out · c continue · p pause · i input · b breakpoint ({points}) · B condition · t tracepoint · w watch · f task · j/k history · q quit")]
 
     def _status_text(self) -> StyleAndTextTuples:
         return [("", f" {self.status}")]
@@ -276,8 +349,10 @@ class RuntimeApp:
         for index, item in enumerate(self.events):
             kind = item.get("kind", "event")
             location = f"{item.get('relative_path', '?')}:{item.get('line', '?')}"
-            lane = item.get("task_name") or f"thread-{item.get('thread_id', '?')}"
-            text = f" {index + 1:>4}  {lane[:14]:14}  {kind:9}  {str(item.get('name', '?'))[:24]:24}  {location}\n"
+            lane = item.get("task_name") or item.get("run_thread_id") or f"thread-{item.get('thread_id', '?')}"
+            subject = (f"{item.get('resource_kind')}.{item.get('operation')}"
+                       if kind in {"resource", "wait"} else item.get("name", "?"))
+            text = f" {index + 1:>4}  {lane[:14]:14}  {kind:9}  {str(subject)[:24]:24}  {location}\n"
             lines.append(("class:selected" if index == self.selected else f"class:{kind}", text))
         return lines
 
@@ -319,7 +394,7 @@ class RuntimeApp:
                 "Press s to launch it paused at its first project event. Press n to let one source event run at a time, "
                 "or c to continue. The dashboard observes application files inside the registered project root; nested "
                 "Python virtual environments are excluded.\n\n"
-                "Values are summarised safely: sensitive variable names are redacted, strings are capped, and arbitrary objects are not repr()'d."
+                "Values are summarised safely: sensitive variable names are redacted, strings and collections are capped, cycles are marked, and arbitrary objects are not repr()'d. j/k navigates recorded history only; it never restores the process to an earlier state."
             )
             return
         item = self.events[self.selected]
@@ -328,19 +403,35 @@ class RuntimeApp:
                  f"Function: {item.get('name', '?')}\n",
                  f"Location: {item.get('relative_path', '?')}:{item.get('line', '?')}\n",
                  f"Lane: {lane} · depth {item.get('call_depth', '?')}\n",
+                 _timing(item),
                  "\nSource context (line events are before execution)\n",
                  self._source_excerpt(item), "\n"]
         changes = item.get("variables")
         if isinstance(changes, dict):
-            for key, label in (("created", "Created"), ("changed", "Changed")):
+            for key, label in (("created", "Created"), ("rebound", "Rebound"), ("mutated", "Mutated in place")):
                 entries = changes.get(key)
                 if isinstance(entries, dict) and entries:
                     lines.append(f"\n{label}\n")
+                    lines.extend(f"  {name} = {_value(value)}\n" for name, value in entries.items())
+            if not changes.get("rebound") and not changes.get("mutated"):
+                entries = changes.get("changed")
+                if isinstance(entries, dict) and entries:
+                    lines.append("\nChanged\n")
                     lines.extend(f"  {name} = {_value(value)}\n" for name, value in entries.items())
             removed = changes.get("removed")
             if isinstance(removed, list) and removed:
                 lines.append("\nRemoved\n")
                 lines.extend(f"  {name}\n" for name in removed)
+            unknown = changes.get("unknown")
+            if isinstance(unknown, list) and unknown:
+                lines.append("\nNative/unknown state (not introspected)\n")
+                lines.extend(f"  {name}\n" for name in unknown)
+            if item.get("globals"):
+                lines.append("\nGlobals at call (bounded)\n")
+                lines.extend(f"  {name} = {_value(value)}\n" for name, value in item["globals"].items())
+            if item.get("arguments"):
+                lines.append("\nArguments (bounded)\n")
+                lines.extend(f"  {name} = {_value(value)}\n" for name, value in item["arguments"].items())
         if item.get("kind") == "call" and isinstance(item.get("inputs"), dict) and item["inputs"]:
             lines.append("\nInputs / locals at call\n")
             lines.extend(f"  {name} = {_value(value)}\n" for name, value in item["inputs"].items())
@@ -348,14 +439,31 @@ class RuntimeApp:
             lines.append(f"\nReturned: {_value(item['output'])}\n")
         if item.get("exception"):
             lines.append(f"\nException: {item['exception']}\n")
-        values = self._variables_at(item)
-        lines.append("\nVariables in this frame at this event\n")
-        if values is None:
-            lines.append("  Unavailable for older sessions without frame IDs.\n")
-        elif not values:
-            lines.append("  No recorded variables.\n")
-        else:
-            lines.extend(f"  {name} = {_value(value)}\n" for name, value in sorted(values.items()))
+        if item.get("kind") == "resource":
+            lines.extend([
+                f"\nResource: {item.get('resource_kind', '?')} · {item.get('operation', '?')} · {item.get('status', '?')}\n",
+                f"Duration: {item.get('duration_seconds', 0):.6f}s\n",
+                f"Capture: {json.dumps(item.get('capture', {}), sort_keys=True)}\n",
+                "Details\n",
+                json.dumps(item.get("details", {}), indent=2, sort_keys=True), "\n",
+            ])
+            if item.get("error"):
+                lines.extend(["Error\n", json.dumps(item["error"], indent=2, sort_keys=True), "\n"])
+            if item.get("call_stack"):
+                lines.append("Origin stack\n")
+                lines.extend(
+                    f"  {frame.get('name', '?')} · {frame.get('relative_path', '?')}:{frame.get('line', '?')}\n"
+                    for frame in item["call_stack"]
+                )
+        if item.get("kind") != "resource":
+            values = self._variables_at(item)
+            lines.append("\nVariables in this frame at this event\n")
+            if values is None:
+                lines.append("  Unavailable for older sessions without frame IDs.\n")
+            elif not values:
+                lines.append("  No recorded variables.\n")
+            else:
+                lines.extend(f"  {name} = {_value(value)}\n" for name, value in sorted(values.items()))
         result = self.session.result() if self.session.started else None
         if result and (result["stdout"] or result["stderr"]):
             lines.append("\nProcess output\n")

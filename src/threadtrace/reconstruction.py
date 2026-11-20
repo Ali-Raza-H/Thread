@@ -8,6 +8,7 @@ and a deliberately small confidence vocabulary.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import tomllib
@@ -17,6 +18,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .advanced import path_kind, resource_class
+from .frameworks import analyse, data_access, import_aliases
 from .store import Store
 
 CONFIRMED = "confirmed"
@@ -73,24 +76,34 @@ class Reconstruction:
             (scan_id,),
         )
         for call in calls:
+            candidates = _json(call["candidate_json"], [])
             if call["resolution"] == "resolved" and call["callee_symbol_id"]:
-                target = self.store.one("SELECT file_id FROM symbols WHERE symbol_id=?", (call["callee_symbol_id"],))
-                target_module = None
-                if target:
-                    target_file = self.store.one("SELECT module_name FROM files WHERE file_id=?", (target["file_id"],))
-                    target_module = target_file["module_name"] if target_file else None
                 self._relationship(
-                    scan_id, call["caller_symbol_id"], call["callee_symbol_id"], call["module_name"], target_module,
-                    "direct_call", CONFIRMED,
-                    self._evidence("call", call["relative_path"], call["line_number"], expression=call["target_expression"]),
+                    scan_id, call["caller_symbol_id"], call["callee_symbol_id"], call["module_name"],
+                    self._symbol_module(call["callee_symbol_id"]), "direct_call", CONFIRMED,
+                    self._evidence("call", call["relative_path"], call["line_number"], expression=call["target_expression"],
+                                  binding=call.get("basis"), reason=f"Resolved through a {call.get('basis') or 'source'} binding."),
                 )
-            elif call["resolution"] == "ambiguous":
-                for candidate in _json(call["candidate_json"], []):
+            elif candidates:
+                reason = (
+                    f"'{call['target_expression']}' has {len(candidates)} equally valid Python bindings, so no single target is confirmed."
+                    if call["resolution"] == "ambiguous" else
+                    f"'{call['target_expression']}' matches {len(candidates)} project definition(s) by name, but no lexical binding, import, or class scope confirms a direct call."
+                )
+                for candidate in candidates:
                     self._relationship(
-                        scan_id, call["caller_symbol_id"], candidate, call["module_name"], None,
-                        "candidate_call", POSSIBLE,
-                        self._evidence("call", call["relative_path"], call["line_number"], expression=call["target_expression"]),
+                        scan_id, call["caller_symbol_id"], candidate, call["module_name"],
+                        self._symbol_module(candidate), "candidate_call", POSSIBLE,
+                        self._evidence("call", call["relative_path"], call["line_number"],
+                                      expression=call["target_expression"], binding=call.get("basis"), reason=reason),
                     )
+
+    def _symbol_module(self, symbol_id: str | None) -> str | None:
+        row = self.store.one(
+            """SELECT f.module_name FROM symbols s JOIN files f ON f.file_id=s.file_id WHERE s.symbol_id=?""",
+            (symbol_id,),
+        )
+        return row["module_name"] if row else None
 
     def _entry_points(self, scan_id: str, root: Path) -> None:
         files = self.store.rows("SELECT * FROM files WHERE scan_id=? AND parse_status='parsed'", (scan_id,))
@@ -136,51 +149,41 @@ class Reconstruction:
                         {"command": name}, HIGH if candidate else POSSIBLE,
                         self._evidence("configuration", source, 1, target=target))
 
+        imports = self.store.rows(
+            """SELECT i.target_module,i.imported_name,i.alias,f.module_name FROM imports i
+               JOIN files f ON f.file_id=i.source_file_id WHERE i.scan_id=?""",
+            (scan_id,),
+        )
+        calls = self.store.rows(
+            """SELECT c.*,f.module_name,f.relative_path FROM calls c JOIN files f ON f.file_id=c.call_file_id
+               WHERE c.scan_id=? ORDER BY f.relative_path,c.line_number""",
+            (scan_id,),
+        )
+        versions = self._declared_versions(scan_id)
+        by_qualified = {symbol["qualified_name"]: symbol for symbol in symbols}
+        by_name = {symbol["name"]: symbol for symbol in symbols}
+        for result in analyse(symbols, imports, calls, versions):
+            handler = by_qualified.get(result.handler or "")
+            if not handler and result.handler:
+                simple = result.handler.replace(".as_view()", "").split(".")[-1]
+                handler = next((item for item in by_module.get(result.module or "", []) if item["name"] == simple), None)
+            if not handler and result.handler:
+                handler = by_name.get(result.handler.replace(".as_view()", "").split(".")[-1])
+            self._entry(
+                scan_id, result.kind, result.name, handler["symbol_id"] if handler else None,
+                result.module or (handler.get("module_name") if handler else None), result.inputs,
+                result.confidence,
+                self._evidence(result.evidence_kind, result.path, result.line, framework=result.framework,
+                               version=result.version, variant=result.variant, registration=result.expression,
+                               capability=result.capability),
+            )
+
         for symbol in symbols:
-            decorators = symbol.get("decorators", [])
-            joined = " ".join(decorators).lower()
             path = symbol["relative_path"]
-            if re.search(r"\.(get|post|put|patch|delete|route)\(", joined):
-                decorator = next(value for value in decorators if re.search(r"\.(get|post|put|patch|delete|route)\(", value.lower()))
-                method = (re.search(r"\.(get|post|put|patch|delete|route)\(", decorator.lower()) or [None, "route"])[1].upper()
-                route = re.search(r"\(\s*['\"]([^'\"]+)", decorator)
-                self._entry(scan_id, "route", f"{method} {route.group(1) if route else symbol['name']}", symbol["symbol_id"],
-                            symbol["module_name"], {"method": method, "route": route.group(1) if route else None}, HIGH,
-                            self._evidence("decorator", path, symbol["line_start"], decorator=decorator))
-            if any(re.search(r"(^|\.)((command)|(group))\b", value.lower()) for value in decorators):
-                self._entry(scan_id, "cli", symbol["name"], symbol["symbol_id"], symbol["module_name"],
-                            {"command": symbol["name"]}, HIGH,
-                            self._evidence("decorator", path, symbol["line_start"], decorators=decorators))
-            if any("task" in value.lower() for value in decorators):
-                self._entry(scan_id, "worker", symbol["name"], symbol["symbol_id"], symbol["module_name"], {}, HIGH,
-                            self._evidence("decorator", path, symbol["line_start"], decorators=decorators))
             is_test_function = symbol["kind"] in {"function", "async_function", "method", "async_method"}
             if is_test_function and (symbol["name"].startswith("test_") or "/tests/" in f"/{path}" or path.startswith("tests/")):
                 self._entry(scan_id, "test", symbol["qualified_name"], symbol["symbol_id"], symbol["module_name"], {}, CONFIRMED,
                             self._evidence("definition", path, symbol["line_start"], name=symbol["name"]))
-
-        argparse_calls = self.store.rows(
-            """SELECT c.*,f.module_name,f.relative_path FROM calls c JOIN files f ON f.file_id=c.call_file_id
-               WHERE c.scan_id=? AND c.target_expression LIKE '%parse_args%'""",
-            (scan_id,),
-        )
-        for call in argparse_calls:
-            self._entry(scan_id, "argparse", f"argparse: {call['module_name']}", call["caller_symbol_id"], call["module_name"], {}, HIGH,
-                        self._evidence("call", call["relative_path"], call["line_number"], expression=call["target_expression"]))
-
-        django_calls = self.store.rows(
-            """SELECT c.*,f.module_name,f.relative_path FROM calls c JOIN files f ON f.file_id=c.call_file_id
-               WHERE c.scan_id=? AND c.target_expression IN ('path','re_path','django.urls.path','django.urls.re_path')""",
-            (scan_id,),
-        )
-        for call in django_calls:
-            arguments = _json(call.get("arguments_json"), [])
-            route = arguments[0].strip("'\"") if arguments else None
-            handler_name = arguments[1] if len(arguments) > 1 else None
-            handler = next((s for s in by_module.get(call["module_name"], []) if s["name"] == handler_name), None)
-            self._entry(scan_id, "route", f"DJANGO {route or call['module_name']}", handler["symbol_id"] if handler else None,
-                        call["module_name"], {"route": route, "framework": "django"}, HIGH if handler else POSSIBLE,
-                        self._evidence("call", call["relative_path"], call["line_number"], expression=call["target_expression"]))
 
     @staticmethod
     def _console_scripts(root: Path) -> list[tuple[str, str, str]]:
@@ -195,21 +198,66 @@ class Reconstruction:
         scripts.update(data.get("tool", {}).get("poetry", {}).get("scripts", {}))
         return [(str(name), str(target), "pyproject.toml") for name, target in scripts.items() if isinstance(target, str)]
 
+    def _declared_versions(self, scan_id: str) -> dict[str, str]:
+        rows = self.store.rows("SELECT name,raw FROM dependencies WHERE scan_id=?", (scan_id,))
+        result: dict[str, str] = {}
+        for row in rows:
+            name = re.sub(r"[-_.]+", "-", row["name"]).lower()
+            spec = row["raw"][len(row["name"]):].strip().split(";", 1)[0].strip()
+            if spec and spec not in {"*", "=="}:
+                result.setdefault(name, spec)
+        return result
+
     def _resources(self, scan_id: str) -> None:
         calls = self.store.rows(
             """SELECT c.*, f.module_name, f.relative_path FROM calls c
                JOIN files f ON f.file_id=c.call_file_id WHERE c.scan_id=?""",
             (scan_id,),
         )
+        imports = self.store.rows(
+            """SELECT i.target_module,i.imported_name,i.alias,f.module_name FROM imports i
+               JOIN files f ON f.file_id=i.source_file_id WHERE i.scan_id=?""",
+            (scan_id,),
+        )
+        versions = self._declared_versions(scan_id)
         for call in calls:
-            classified = self._resource_kind(call["target_expression"])
+            arguments = _json(call.get("arguments_json"), [])
+            argument = arguments[0] if arguments else self._literal_path(call["target_expression"])
+            literal = None
+            if argument:
+                try:
+                    value = ast.literal_eval(argument)
+                    literal = str(value) if isinstance(value, (str, int, float)) else None
+                except (ValueError, SyntaxError):
+                    literal = None
+            classified = self._resource_kind(call["target_expression"], literal or argument)
+            framework = None
+            accessed = data_access(call["target_expression"], imports, import_aliases(imports, call["module_name"]), versions)
+            if accessed:
+                accessed_kind, accessed_operation, framework, _ = accessed
+                classified = classified or (accessed_kind, accessed_operation)
             if not classified:
                 continue
             kind, operation = classified
+            name, confidence = self._resource_name(call)
+            details = {"expression": call["target_expression"], "framework": framework, "path_kind": path_kind(literal) if literal else None,
+                       "unresolved": argument is not None and literal is None}
             self.store.execute(
                 "INSERT INTO resources VALUES(?,?,?,?,?,?,?,?,?)",
-                (_id(), scan_id, call["caller_symbol_id"], call["module_name"], kind, call["target_expression"], operation,
-                 CONFIRMED, self.store.json(self._evidence("call", call["relative_path"], call["line_number"], expression=call["target_expression"]))),
+                (_id(), scan_id, call["caller_symbol_id"], call["module_name"], kind, name, operation,
+                 confidence, self.store.json(self._evidence("call", call["relative_path"], call["line_number"], **details))),
+            )
+        for reference in self.store.rows(
+            """SELECT r.expression,r.line_number,f.relative_path,f.module_name FROM symbol_references r
+               JOIN files f ON f.file_id=r.file_id WHERE r.scan_id=? AND r.expression IN
+               ('sys.executable','sys.version','sys.version_info','platform.python_version') ORDER BY f.relative_path,r.line_number""",
+            (scan_id,),
+        ):
+            self.store.execute(
+                "INSERT INTO resources VALUES(?,?,?,?,?,?,?,?,?)",
+                (_id(), scan_id, None, reference["module_name"], "interpreter", reference["expression"], "read", CONFIRMED,
+                 self.store.json(self._evidence("reference", reference["relative_path"], reference["line_number"],
+                                                expression=reference["expression"]))),
             )
 
     def _dynamic_boundaries(self, scan_id: str) -> None:
@@ -230,21 +278,68 @@ class Reconstruction:
                 ))
 
     @staticmethod
-    def _resource_kind(expression: str) -> tuple[str, str] | None:
+    def _literal_path(expression: str) -> str | None:
+        """Find a literal path passed to Path/open in a dotted call expression."""
+        try:
+            tree = ast.parse(expression, mode="eval")
+        except SyntaxError:
+            return None
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            name = node.func.id if isinstance(node.func, ast.Name) else (
+                node.func.attr if isinstance(node.func, ast.Attribute) else ""
+            )
+            if name not in {"Path", "PurePath", "open"}:
+                continue
+            try:
+                value = ast.literal_eval(node.args[0])
+            except (ValueError, SyntaxError):
+                continue
+            if isinstance(value, str):
+                return value
+        return None
+
+    @staticmethod
+    def _resource_kind(expression: str, argument: str | None = None) -> tuple[str, str] | None:
         value = expression.lower()
+        if value in {"path", "pathlib.path"}:
+            return (path_kind(argument) if argument else "file"), "reference"
         if value in {"open", "path.open", "path.read_text", "path.write_text", "path.read_bytes", "path.write_bytes"} or ".read_text" in value or ".write_text" in value:
-            return "file", "write" if "write" in value else "read"
+            return (path_kind(argument) if argument else "file"), "write" if "write" in value else "read"
         if value.startswith(("requests.", "httpx.", "urllib.")) or ".request" in value:
-            return "http", value.rsplit(".", 1)[-1]
+            return "service", value.rsplit(".", 1)[-1]
         if value.startswith(("subprocess.", "os.system")):
             return "subprocess", value.rsplit(".", 1)[-1]
         if value.startswith(("os.getenv", "os.environ")):
-            return "env", "read"
+            return "environment", "read"
         if any(token in value for token in ("sqlite", "sqlalchemy", "psycopg", ".execute", ".commit", ".connect")):
             return "database", value.rsplit(".", 1)[-1]
         if any(token in value for token in ("celery", ".delay", ".apply_async", ".publish", ".enqueue")):
             return "queue", value.rsplit(".", 1)[-1]
+        if value.startswith(("json.", "pickle.", "marshal.", "yaml.", "gzip.", "bz2.", "lzma.", "zipfile.", "tarfile.",
+                            "csv.", "xml.", "configparser.", "tomllib.", "toml.", "importlib.resources", "pkg_resources.")) \
+                or value.endswith(("render_template", "render_template_string", "get_template", "TemplateResponse")):
+            return resource_class(expression, argument)[0], value.rsplit(".", 1)[-1]
         return None
+
+    @staticmethod
+    def _resource_name(call: dict[str, Any]) -> tuple[str, str]:
+        """Prefer a literal or preserved source expression over an API name."""
+        arguments = _json(call.get("arguments_json"), [])
+        if arguments:
+            try:
+                value = ast.literal_eval(arguments[0])
+            except (ValueError, SyntaxError):
+                value = None
+            if isinstance(value, (str, int, float)):
+                return str(value), CONFIRMED
+            if "path" in call["target_expression"].lower() or "open" in call["target_expression"].lower():
+                return arguments[0], POSSIBLE
+        literal_path = Reconstruction._literal_path(call["target_expression"])
+        if literal_path:
+            return literal_path, CONFIRMED
+        return call["target_expression"], POSSIBLE
 
     def _data_edges(self, scan_id: str) -> None:
         calls = self.store.rows("SELECT * FROM calls WHERE scan_id=? AND resolution='resolved'", (scan_id,))

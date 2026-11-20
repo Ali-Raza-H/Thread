@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +20,7 @@ from prompt_toolkit.layout.margins import ScrollbarMargin
 from prompt_toolkit.widgets import Frame, TextArea
 
 from .engine import Engine, ThreadError
-from .runtime.host import live_sessions
+from .runtime.host import LiveTransportError, live_sessions, receive_live_events, release_live_listener
 
 
 def _value(summary: Any) -> str:
@@ -27,20 +28,32 @@ def _value(summary: Any) -> str:
     if not isinstance(summary, dict):
         return "<unavailable>"
     kind = str(summary.get("type", "unknown"))
+    identity = f" @{summary['object_id']}" if summary.get("object_id") else ""
+    if summary.get("cycle"):
+        return f"<cycle to {summary.get('reference') or 'parent'}>"
     if "value" in summary:
         value = summary["value"]
-        if value in ("<redacted>", "<object>"):
-            return f"{value} ({kind})"
-        return f"{value!r} ({kind})"
+        if value in ("<redacted>", "<object>", "<native/opaque object>"):
+            return f"{value} ({kind}){identity}"
+        return f"{value!r} ({kind}){identity}"
     if "preview" in summary:
         preview = summary["preview"]
         suffix = "…" if summary.get("length", 0) > len(preview) else ""
-        return f"{preview!r}{suffix} (str, length {summary.get('length', '?')})"
+        return f"{preview!r}{suffix} (str, length {summary.get('length', '?')}){identity}"
     if "length" in summary:
-        keys = summary.get("keys")
-        suffix = f", keys: {', '.join(map(str, keys))}" if isinstance(keys, list) and keys else ""
-        return f"<{kind}, length {summary['length']}{suffix}>"
-    return f"<{kind}>"
+        suffix = " (truncated)" if summary.get("truncated") else ""
+        return f"<{kind}, length {summary['length']}{suffix}>{identity}"
+    if "summary" in summary:
+        return f"<{kind}: {summary['summary']}>{identity}"
+    return f"<{kind}>{identity}"
+
+
+def _timing(item: dict[str, Any]) -> str:
+    elapsed = item.get("elapsed_seconds")
+    cpu = item.get("cpu_seconds")
+    if not isinstance(elapsed, (int, float)) or not isinstance(cpu, (int, float)):
+        return "Timing: unavailable\n"
+    return f"Timing: +{elapsed:.6f}s elapsed · {cpu:.6f}s CPU\n"
 
 
 class LiveRuntimeApp:
@@ -55,14 +68,18 @@ class LiveRuntimeApp:
         if not sessions:
             raise ThreadError("No Runtime Host session exists for this project. Start one with: threadtrace runtime-host PROJECT -- COMMAND")
         self.metadata = sessions[0]
-        self.log_path = Path(self.metadata["log_path"])
-        self.offset = 0
+        self.listener_id = uuid.uuid4().hex
         self.events: list[dict[str, Any]] = []
         self.frame_events: dict[str, list[int]] = {}
         self.frame_values: dict[str, dict[str, Any]] = {}
         self.selected = 0
         self.following = True
         self.status = "Waiting for project events."
+        self.latest = 0
+        self.dropped = 0
+        self.lag = 0
+        self.journal_truncated = False
+        self.journal_error: str | None = None
         self.events_control = FormattedTextControl(self._events_text, focusable=True, get_cursor_position=self._cursor)
         self.inspector = TextArea(text="", read_only=True, focusable=True, focus_on_click=True, wrap_lines=True, scrollbar=True)
         root = HSplit([
@@ -80,10 +97,13 @@ class LiveRuntimeApp:
     @staticmethod
     def _style() -> Any:
         from prompt_toolkit.styles import Style
-        return Style.from_dict({"header": "bg:#1c3144 #eaf6ff bold", "status": "bg:#244d68 #eaf6ff", "frame.border": "#6098b8", "frame.label": "#a9e2ff bold", "selected": "bg:#327397 #ffffff bold", "call": "#a9ddff", "return": "#a8e6ae", "line": "#e4e4e4", "exception": "#ffb3b3"})
+        return Style.from_dict({"header": "bg:#1c3144 #eaf6ff bold", "status": "bg:#244d68 #eaf6ff", "frame.border": "#6098b8", "frame.label": "#a9e2ff bold", "selected": "bg:#327397 #ffffff bold", "call": "#a9ddff", "return": "#a8e6ae", "line": "#e4e4e4", "exception": "#ffb3b3", "resource": "#ffd580"})
 
     def run(self) -> None:
-        self.app.run()
+        try:
+            self.app.run()
+        finally:
+            release_live_listener(self.metadata, self.listener_id)
 
     def _select_event(self, index: int) -> None:
         if self.events:
@@ -122,6 +142,7 @@ class LiveRuntimeApp:
         @keys.add("q", filter=timeline_focused)
         @keys.add("c-c")
         def quit_app(event: Any) -> None:
+            release_live_listener(self.metadata, self.listener_id)
             event.app.exit()
         return keys
 
@@ -141,61 +162,76 @@ class LiveRuntimeApp:
         self._refresh_metadata()
         previous_count = len(self.events)
         try:
-            with self.log_path.open("r", encoding="utf-8", errors="replace") as handle:
-                handle.seek(self.offset)
-                while True:
-                    start = handle.tell()
-                    line = handle.readline()
-                    if not line:
-                        break
-                    if not line.endswith("\n"):
-                        handle.seek(start)
-                        break
-                    self.offset = handle.tell()
-                    try:
-                        item = json.loads(line)
-                        path = Path(item["path"]).resolve()
-                        if not path.is_relative_to(self.root):
-                            continue
-                        item["relative_path"] = path.relative_to(self.root).as_posix()
-                        index = len(self.events)
-                        self.events.append(item)
-                        frame_id = item.get("frame_id")
-                        if isinstance(frame_id, str):
-                            self.frame_events.setdefault(frame_id, []).append(index)
-                            values = self.frame_values.setdefault(frame_id, {})
-                            self._apply_changes(values, item)
-                    except (OSError, ValueError, KeyError, TypeError):
-                        continue
-        except OSError:
+            items, latest, report = receive_live_events(self.metadata, len(self.events), self.listener_id)
+        except LiveTransportError as error:
+            self.status = f"Listener transport error: {error}"
             return
+        self.latest = latest
+        self.dropped = int(report.get("dropped", 0))
+        self.lag = int(report.get("lag", 0))
+        self.journal_truncated = bool(report.get("journal_truncated", False))
+        self.journal_error = report.get("journal_error")
+        for item in items:
+            self._add_event(item)
+        self.status = "Receiving project events."
+        if self.dropped:
+            self.status += f" {self.dropped} event(s) dropped at the Host limit."
+        if self.journal_truncated:
+            self.status += " The local journal is truncated."
+        if self.journal_error:
+            self.status += f" Journal error: {self.journal_error}"
+        if self.lag:
+            self.status += f" {self.lag} event(s) pending."
         if self.following and len(self.events) > previous_count:
             self.selected = len(self.events) - 1
             self._refresh_inspector()
+
+    def _add_event(self, item: dict[str, Any]) -> None:
+        try:
+            path = Path(item["path"]).resolve()
+            if not path.is_relative_to(self.root):
+                return
+            item["relative_path"] = path.relative_to(self.root).as_posix()
+        except (OSError, ValueError, KeyError, TypeError):
+            return
+        index = len(self.events)
+        self.events.append(item)
+        frame_id = item.get("frame_id")
+        if isinstance(frame_id, str):
+            self.frame_events.setdefault(frame_id, []).append(index)
+            values = self.frame_values.setdefault(frame_id, {})
+            self._apply_changes(values, item)
 
     def _refresh_metadata(self) -> None:
         try:
             sessions = live_sessions(self.root, self.metadata["session_id"])
             if sessions:
                 self.metadata = sessions[0]
-        except (ThreadError, OSError):
-            pass
+                if self.metadata.get("status") == "finished":
+                    self.status = "The Host session has finished; recorded events remain visible."
+            else:
+                self.status = "Host session metadata is no longer available; showing the last received events."
+        except (ThreadError, OSError) as error:
+            self.status = f"Could not refresh Host status: {error}"
 
     def _header_text(self) -> StyleAndTextTuples:
-        return [("class:title", f" Thread Live Runtime / {self.project_row['name']} / {self.metadata['status']}"),
+        return [("class:title", f" ThreadTrace Live Runtime / {self.project_row['name']} / {self.metadata['status']}"),
                 ("", "   j/k events · l live · Tab details · q quit")]
 
     def _status_text(self) -> StyleAndTextTuples:
         mode = "LIVE" if self.following else "HISTORY (l to follow)"
-        return [("", f" {mode} · {len(self.events)} events · passive listener · values are safe summaries")]
+        return [("", f" {mode} · {self.status} · {len(self.events)} received / {self.latest} host events · passive listener")]
 
     def _events_text(self) -> StyleAndTextTuples:
         if not self.events:
             return [("", "\n  Waiting for project Python events…\n")]
         lines: StyleAndTextTuples = []
         for index, item in enumerate(self.events):
-            lane = item.get("task_name") or f"thread-{item.get('thread_id', '?')}"
-            text = f" {index + 1:>5}  {item.get('kind', 'event'):9}  {str(item.get('name', '?'))[:24]:24}  {item.get('relative_path', '?')}:{item.get('line', '?')}  [{lane}]\n"
+            lane = item.get("task_name") or item.get("run_thread_id") or f"thread-{item.get('thread_id', '?')}"
+            kind = item.get("kind", "event")
+            subject = (f"{item.get('resource_kind')}.{item.get('operation')}"
+                       if kind in {"resource", "wait"} else item.get("name", "?"))
+            text = f" {index + 1:>5}  {kind:9}  {str(subject)[:24]:24}  {item.get('relative_path', '?')}:{item.get('line', '?')}  [{lane}]\n"
             lines.append(("class:selected" if index == self.selected else f"class:{item.get('kind', 'line')}", text))
         return lines
 
@@ -236,24 +272,40 @@ class LiveRuntimeApp:
             self.inspector.text = "Waiting for events. Use the program in the host terminal; this listener never controls it."
             return
         item = self.events[self.selected]
-        lane = item.get("task_name") or f"thread-{item.get('thread_id', '?')}"
+        lane = item.get("task_name") or item.get("run_thread_id") or f"thread-{item.get('thread_id', '?')}"
         lines = [f"Event {self.selected + 1} / {len(self.events)}: {item.get('kind', 'event')}\n",
                  f"Function: {item.get('name', '?')}\n",
                  f"Location: {item.get('relative_path', '?')}:{item.get('line', '?')}\n",
                  f"Lane: {lane} · depth {item.get('call_depth', '?')}\n",
+                 _timing(item),
                  "\nSource context (line events are before execution)\n",
                  self._source_excerpt(item), "\n"]
         changes = item.get("variables")
         if isinstance(changes, dict):
-            for key, label in (("created", "Created"), ("changed", "Changed")):
+            for key, label in (("created", "Created"), ("rebound", "Rebound"), ("mutated", "Mutated in place")):
                 entries = changes.get(key)
                 if isinstance(entries, dict) and entries:
                     lines.append(f"\n{label}\n")
+                    lines.extend(f"  {name} = {_value(value)}\n" for name, value in entries.items())
+            if not changes.get("rebound") and not changes.get("mutated"):
+                entries = changes.get("changed")
+                if isinstance(entries, dict) and entries:
+                    lines.append("\nChanged\n")
                     lines.extend(f"  {name} = {_value(value)}\n" for name, value in entries.items())
             removed = changes.get("removed")
             if isinstance(removed, list) and removed:
                 lines.append("\nRemoved\n")
                 lines.extend(f"  {name}\n" for name in removed)
+            unknown = changes.get("unknown")
+            if isinstance(unknown, list) and unknown:
+                lines.append("\nNative/unknown state (not introspected)\n")
+                lines.extend(f"  {name}\n" for name in unknown)
+            if item.get("globals"):
+                lines.append("\nGlobals at call (bounded)\n")
+                lines.extend(f"  {name} = {_value(value)}\n" for name, value in item["globals"].items())
+            if item.get("arguments"):
+                lines.append("\nArguments (bounded)\n")
+                lines.extend(f"  {name} = {_value(value)}\n" for name, value in item["arguments"].items())
         if item.get("kind") == "call" and isinstance(item.get("inputs"), dict) and item["inputs"]:
             lines.append("\nInputs / locals at call\n")
             lines.extend(f"  {name} = {_value(value)}\n" for name, value in item["inputs"].items())
@@ -261,13 +313,30 @@ class LiveRuntimeApp:
             lines.append(f"\nReturned: {_value(item['output'])}\n")
         if item.get("exception"):
             lines.append(f"\nException: {item['exception']}\n")
-        values = self._variables_at(item)
-        lines.append("\nVariables in this frame at this event\n")
-        if values is None:
-            lines.append("  Unavailable for older sessions without frame IDs.\n")
-        elif not values:
-            lines.append("  No recorded variables.\n")
-        else:
-            lines.extend(f"  {name} = {_value(value)}\n" for name, value in sorted(values.items()))
+        if item.get("kind") == "resource":
+            lines.extend([
+                f"\nResource: {item.get('resource_kind', '?')} · {item.get('operation', '?')} · {item.get('status', '?')}\n",
+                f"Duration: {item.get('duration_seconds', 0):.6f}s\n",
+                f"Capture: {json.dumps(item.get('capture', {}), sort_keys=True)}\n",
+                "Details\n",
+                json.dumps(item.get("details", {}), indent=2, sort_keys=True), "\n",
+            ])
+            if item.get("error"):
+                lines.extend(["Error\n", json.dumps(item["error"], indent=2, sort_keys=True), "\n"])
+            if item.get("call_stack"):
+                lines.append("Origin stack\n")
+                lines.extend(
+                    f"  {frame.get('name', '?')} · {frame.get('relative_path', '?')}:{frame.get('line', '?')}\n"
+                    for frame in item["call_stack"]
+                )
+        if item.get("kind") != "resource":
+            values = self._variables_at(item)
+            lines.append("\nVariables in this frame at this event\n")
+            if values is None:
+                lines.append("  Unavailable for older sessions without frame IDs.\n")
+            elif not values:
+                lines.append("  No recorded variables.\n")
+            else:
+                lines.extend(f"  {name} = {_value(value)}\n" for name, value in sorted(values.items()))
         self.inspector.text = "".join(lines)
         self.inspector.buffer.cursor_position = 0

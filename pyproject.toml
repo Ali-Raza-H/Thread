@@ -11,8 +11,8 @@ requires-python = ">=3.11"
 dependencies = [
     "prompt_toolkit>=3.0.43",
 ]
-license = {text = "MIT"}
-authors = [{name = "Traceback"}]
+license = {text = "GPL-3.0-only"}
+authors = [{name = "Ali Raza"}]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",

@@ -104,7 +104,7 @@ def stop_process_tree(selected: dict[str, Any]) -> list[int]:
         except ProcessLookupError:
             continue
         except PermissionError as exc:
-            raise ThreadError(f"Thread is not allowed to stop PID {item['pid']}.") from exc
+            raise ThreadError(f"ThreadTrace is not allowed to stop PID {item['pid']}.") from exc
     deadline = time.monotonic() + 1.5
     while time.monotonic() < deadline:
         remaining = [item for item in tree if Path(f"/proc/{item['pid']}").exists()]

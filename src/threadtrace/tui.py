@@ -31,7 +31,7 @@ class ThreadApp:
         self.queries = queries
         self.project = project
         self.project_row = engine.get_project(project)
-        self.current_view = "guide"
+        self.current_view = "overview"
         self.rows: list[dict[str, Any]] = []
         self.selected = 0
         self.status = "Ready. Press ? for help."
@@ -67,7 +67,7 @@ class ThreadApp:
         root = HSplit([
             Window(FormattedTextControl(self._header_text), height=1, style="class:header"),
             VSplit([
-                Frame(Window(self.navigation, always_hide_cursor=True), title="Thread", width=Dimension(preferred=25)),
+                Frame(Window(self.navigation, always_hide_cursor=True), title="ThreadTrace", width=Dimension(preferred=25)),
                 HSplit([
                     self.search,
                     Frame(self.results_window, title="Explore", height=Dimension(weight=3)),
@@ -81,7 +81,7 @@ class ThreadApp:
             layout=self.main_layout, key_bindings=self._key_bindings(),
             full_screen=True, mouse_support=True, style=self._style(),
         )
-        self._load_view("guide")
+        self._load_view("overview")
 
     @staticmethod
     def _style() -> Any:
@@ -111,7 +111,7 @@ class ThreadApp:
 
         @bindings.add("?", filter=main_mode)
         def help_view(event: Any) -> None:
-            self.status = "g guide · 1-9 choose start · w walk · m files · c code · / search · Tab inspector · r rescan · q quit"
+            self.status = "o overview · e entrypoints · m files · c code · / search · Tab inspector · r rescan · q quit"
 
         @bindings.add("/", filter=main_mode)
         def search(event: Any) -> None:
@@ -125,14 +125,14 @@ class ThreadApp:
             self._searching = False
             event.app.layout.focus(self.search)
 
-        for key, view in (("g", "guide"), ("o", "overview"), ("e", "entrypoints"), ("a", "architecture"), ("u", "resources"),
+        for key, view in (("g", "overview"), ("o", "overview"), ("e", "entrypoints"), ("a", "architecture"), ("u", "resources"),
                           ("f", "functions"), ("d", "findings"),
                           ("l", "libraries"), ("x", "cycles")):
             bindings.add(key, filter=main_mode)(lambda event, view=view: self._load_view(view))
 
         @bindings.add("w", filter=main_mode)
         def walk_selected(event: Any) -> None:
-            self._walk_selected()
+            self.status = "The archived Guided Walk feature is unavailable. Use Path, Entrypoints, and graph views instead."
 
         @bindings.add("m", filter=main_mode)
         def map_selected(event: Any) -> None:
@@ -176,7 +176,7 @@ class ThreadApp:
 
         @bindings.add("c", filter=main_mode)
         def code_or_classes(event: Any) -> None:
-            if self.current_view in {"guide", "walk", "file_map", "file_graph", "code_graph"}:
+            if self.current_view in {"file_map", "file_graph", "code_graph"}:
                 self._open_selected_source()
             else:
                 self._load_view("classes")
@@ -200,7 +200,7 @@ class ThreadApp:
             event.app.invalidate()
             try:
                 self.engine.scan(self.project)
-                self._load_view("guide")
+                self._load_view("overview")
                 self.status = "Scan completed."
             except ThreadError as exc:
                 self.status = f"Scan failed: {exc}"
@@ -223,7 +223,7 @@ class ThreadApp:
 
         @bindings.add("backspace", filter=main_mode)
         def back(event: Any) -> None:
-            self._load_view("guide")
+            self._load_view("overview")
 
         @bindings.add("pagedown", filter=inspector_focused)
         @bindings.add("c-f", filter=inspector_focused)
@@ -322,7 +322,7 @@ class ThreadApp:
         if walkthrough["steps"]:
             self.status = f"Guided walkthrough: {walkthrough['entry_point']}. Use m for linked files or c for code."
         else:
-            self.status = walkthrough.get("stopped_at") or "Thread found no resolved static steps after this starting point."
+            self.status = walkthrough.get("stopped_at") or "ThreadTrace found no resolved static steps after this starting point."
         self.app.invalidate()
 
     def _map_selected_or_modules(self) -> None:
@@ -615,12 +615,12 @@ class ThreadApp:
             self.status = f"Cannot verify source before saving: {exc}"
             return
         if self.source_file_hash and self._content_hash(on_disk) != self.source_file_hash:
-            self.status = "Save refused: this file changed outside Thread after it was opened. Reopen it and merge the edits."
+            self.status = "Save refused: this file changed outside ThreadTrace after it was opened. Reopen it and merge the edits."
             return
         replacement = self.source_editor.text
         if self.source_is_slice:
             if self.source_slice_start is None or self.source_slice_end is None:
-                self.status = "Save refused: Thread lost the selected definition boundary. Reopen the definition."
+                self.status = "Save refused: ThreadTrace lost the selected definition boundary. Reopen the definition."
                 return
             original_lines = self.source_file_original.splitlines(keepends=True)
             replacement_lines = replacement.splitlines(keepends=True)
@@ -692,19 +692,19 @@ class ThreadApp:
             self._ai_explain()
             return
         actions = {
-            "guide": lambda: self._load_view("guide"), "overview": lambda: self._load_view("overview"), "entrypoints": lambda: self._load_view("entrypoints"),
+            "overview": lambda: self._load_view("overview"), "entrypoints": lambda: self._load_view("entrypoints"),
             "architecture": lambda: self._load_view("architecture"), "resources": lambda: self._load_view("resources"),
             "file-graph": lambda: self._open_graph("file"), "code-graph": lambda: self._open_graph("code"),
             "scan": lambda: self.engine.scan(self.project), "quit": lambda: self.app.exit(), "q": lambda: self.app.exit(),
         }
         action = actions.get(command)
         if not action:
-            self.status = f"Unknown command: {command or '(empty)'}. Try :guide, :file-graph, :code-graph, :overview, :ai, :scan, or :quit."
+            self.status = f"Unknown command: {command or '(empty)'}. Try :file-graph, :code-graph, :overview, :ai, :scan, or :quit."
             return
         try:
             action()
             if command == "scan":
-                self._load_view("guide")
+                self._load_view("overview")
             self.status = f"Executed :{command}."
         except ThreadError as exc:
             self.status = f"Command failed: {exc}"
@@ -807,13 +807,13 @@ class ThreadApp:
         self.inspector.buffer.cursor_position = 0
 
     def _header_text(self) -> StyleAndTextTuples:
-        return [("class:title", f" Thread  /  {self.project_row['name']}"), ("", f"     {self.current_view.title()}")]
+        return [("class:title", f" ThreadTrace  /  {self.project_row['name']}"), ("", f"     {self.current_view.title()}")]
 
     def _navigation_text(self) -> StyleAndTextTuples:
         return [
-            ("class:title", "Start here\n"), ("", " [g] Guided tour\n [e] Entrypoints\n [a] Architecture\n [u] Resources\n\n"),
+            ("class:title", "Explore\n"), ("", " [o] Overview\n [e] Entrypoints\n [a] Architecture\n [u] Resources\n\n"),
             ("class:title", "Browse\n"), ("", " [m] Modules\n [f] Functions\n [c] Classes\n [p] File graph\n [d] Findings\n [l] Libraries\n [x] Cycles\n\n"),
-            ("class:muted", " Guided: 1-9 walk · w walk · m files · c code · y lesson\n Graph: p file · t switch · j/k follow · +/- zoom · [/] confidence · ,/. type\n / Search\n : Commands\n r Rescan\n ? Help\n q Quit"),
+            ("class:muted", " Details: m files · c code · y lesson\n Graph: p file · t switch · j/k follow · +/- zoom · [/] confidence · ,/. type\n / Search\n : Commands\n r Rescan\n ? Help\n q Quit"),
         ]
 
     def _results_text(self) -> StyleAndTextTuples:

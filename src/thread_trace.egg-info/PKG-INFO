@@ -2,28 +2,33 @@ Metadata-Version: 2.4
 Name: thread-trace
 Version: 0.7.0a1
 Summary: Local-first static analysis for Python projects
-Author: Traceback
-License: MIT
+Author: Ali Raza
+License: GPL-3.0-only
 Classifier: Programming Language :: Python :: 3
 Classifier: Programming Language :: Python :: 3.11
 Classifier: Programming Language :: Python :: 3.12
 Classifier: Programming Language :: Python :: 3.13
 Requires-Python: >=3.11
 Description-Content-Type: text/markdown
+License-File: LICENSE
 Requires-Dist: prompt_toolkit>=3.0.43
+Dynamic: license-file
 
-# Thread
+# ThreadTrace
 
-Thread 0.6.0-alpha.1 is a terminal-first, local static analysis tool for Python projects. It reads source with Python's AST parser and never imports or runs the project being analysed.
+ThreadTrace 0.7.0-alpha.1 is a terminal-first, local static analysis tool for Python projects. It reads source with Python's AST parser and never imports or runs the project being analysed.
 
 See the complete [user manual](USER_MANUAL.md) for installation, every command,
 the terminal explorer, local Ollama explanations, runtime-tracing safety, and
 troubleshooting.
 
+ThreadTrace is licensed under [GPL-3.0-only](LICENSE).
+See [CHANGELOG.md](CHANGELOG.md) for the canonical release history.
+
 It reconstructs evidence-backed entry points, architecture components, static
 call paths, direct argument/return flow, and external resource boundaries. A
 relationship is always labelled `confirmed`, `high`, `possible`, or `unknown`;
-Thread does not turn a dynamic Python guess into a fact.
+ThreadTrace does not turn a dynamic Python guess into a fact.
 
 ## Quick start
 
@@ -35,16 +40,16 @@ threadtrace functions example
 threadtrace deps example app.core --depth 2
 threadtrace diagnostics example
 threadtrace overview example --format markdown
-threadtrace guide example
 threadtrace entrypoints example
 threadtrace architecture example --format mermaid
 threadtrace path example "POST /users"
 threadtrace resources example --kind database
 threadtrace impact example app.services.users.register
 threadtrace dataflow example app.routes.create_user --to database
-threadtrace walk example "POST /users"
 threadtrace map example "POST /users"
 threadtrace findings example
+threadtrace capabilities example
+threadtrace browser example
 ```
 
 Use `--format json` with query commands for machine-readable output. Scans are explicit; query commands use the most recently completed scan.
@@ -52,8 +57,25 @@ Use `--format json` with query commands for machine-readable output. Scans are e
 ## Terminal explorer
 
 Use `explain` for a concise evidence-grounded description and `compare` to
-compare two completed scan IDs. JSON is the stable integration format;
-architecture also exports Mermaid and DOT.
+compare two completed scan IDs. JSON is the stable integration format.
+Reports can also be exported as Markdown, CSV, self-contained HTML, Mermaid,
+or DOT where the selected result supports a graph.
+
+## Local browser companion
+
+After a scan, start a read-only browser view with:
+
+```console
+threadtrace browser example
+```
+
+ThreadTrace binds only to `127.0.0.1` by default and prints a local URL for
+you to open in a browser of your choice. Use `--host ::1` for IPv6 loopback or
+`--port PORT` to choose a specific local port. The view presents stored static
+results only; it cannot run or control the target program.
+
+Run `threadtrace config init` to create the optional nonsecret per-user
+configuration file for the database and browser defaults.
 
 Runtime correlation is optional and never happens during a scan or TUI launch.
 It runs only a command you explicitly provide, for example
@@ -63,7 +85,7 @@ are stored separately and labelled `runtime`.
 
 ## Optional AI explanations
 
-Thread can ask a small local Ollama model to explain its *stored evidence*;
+ThreadTrace can ask a small local Ollama model to explain its *stored evidence*;
 it never automatically sends repository files or runs AI during scans. The
 response is labelled AI-assisted and instructed to cite source locations.
 
@@ -87,12 +109,10 @@ Open a keyboard-first, full-screen explorer for a completed scan:
 threadtrace tui example
 ```
 
-It opens in **Guided** mode. Pick a suggested starting point with `1`–`9`, then
-use `w` to follow one supported path, `m` to see the files involved, and `c` to
-open code. `g` returns to Guided mode; `o`, `e`, `a`, `u`, `f`, `d`, `l`, and `x`
-open the more technical views. Press `/` to search, `:` for the command palette,
-`r` to rescan, and `q` to quit. The explorer is built with `prompt_toolkit`, not
-Textual.
+It opens on the documented static overview. Use entry points, architecture,
+paths, source inspection, and focused graphs to investigate a project. Press
+`/` to search, `:` for commands, `r` to rescan, and `q` to quit. The explorer
+is built with `prompt_toolkit`, not Textual.
 
 Press `p` for the **File Graph**: files are nodes and labelled edges represent
 imports or cross-file calls. In the graph, press `t` to switch to the **Code
@@ -103,7 +123,7 @@ filter confidence, and `,`/`.` to filter relationship type.
 
 ## Step-by-step runtime dashboard
 
-For a controlled view of one real execution, give Thread the exact command that
+For a controlled view of one real execution, give ThreadTrace the exact command that
 starts the project:
 
 ```console
@@ -120,7 +140,7 @@ sandbox.
 
 ## Running-process discovery
 
-On Linux, Thread can safely discover Python interpreters owned by your current
+On Linux, ThreadTrace can safely discover Python interpreters owned by your current
 user:
 
 ```console
@@ -132,7 +152,7 @@ threadtrace process 12345
 `process` opens a confirmation screen with the PID, command, inferred project
 root, detected venv, and descendants. From there you can scan the selected
 project normally, or explicitly stop its process tree and restart the exact
-command under the Runtime dashboard. Thread does not attach to or inject into
+command under the Runtime dashboard. ThreadTrace does not attach to or inject into
 an already-running interpreter in this release.
 
 ## Live observation for interactive TUIs
@@ -144,15 +164,16 @@ the program, then open a passive listener in a second terminal:
 # Terminal A — ARIA retains its real TUI and input/output.
 threadtrace runtime-host ARIA -- dev run aria
 
-# Terminal B — Thread follows it without pausing or hijacking ARIA.
+# Terminal B — ThreadTrace follows it without pausing or hijacking ARIA.
 threadtrace runtime-listen ARIA
 ```
 
-The host publishes safe project-root trace events through a private local
-session. The listener is read-only, so ARIA continues normally while Thread
-shows live calls, source lines, variable summaries, returns, and exceptions.
+On Linux, the host publishes safe project-root trace events through a private
+current-user Unix-domain socket. The listener is read-only, so ARIA continues
+normally while ThreadTrace shows live calls, source lines, variable summaries,
+returns, and exceptions.
 
 ## Scope and limits
 
-Thread reports static evidence: definitions, imports, syntactic calls, class relationships, and local data movement. Python can select values and call targets dynamically, so uncertain calls are shown as ambiguous or unresolved rather than guessed. A data-flow view is intra-function and does not claim to track values through arbitrary runtime behaviour.
+ThreadTrace reports static evidence: definitions, imports, syntactic calls, class relationships, and local data movement. Python can select values and call targets dynamically, so uncertain calls are shown as ambiguous or unresolved rather than guessed. A data-flow view is intra-function and does not claim to track values through arbitrary runtime behaviour.
 

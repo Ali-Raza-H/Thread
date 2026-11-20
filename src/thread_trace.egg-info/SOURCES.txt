@@ -1,3 +1,4 @@
+LICENSE
 README.md
 pyproject.toml
 src/thread_trace.egg-info/PKG-INFO
@@ -9,8 +10,12 @@ src/thread_trace.egg-info/top_level.txt
 src/threadtrace/__init__.py
 src/threadtrace/__main__.py
 src/threadtrace/ai.py
+src/threadtrace/browser.py
+src/threadtrace/capabilities.py
 src/threadtrace/cli.py
+src/threadtrace/config.py
 src/threadtrace/engine.py
+src/threadtrace/hybrid.py
 src/threadtrace/live_tui.py
 src/threadtrace/models.py
 src/threadtrace/parser.py
@@ -22,6 +27,8 @@ src/threadtrace/runtime_tui.py
 src/threadtrace/store.py
 src/threadtrace/tui.py
 src/threadtrace/runtime/__init__.py
+src/threadtrace/runtime/adapters.py
+src/threadtrace/runtime/failure.py
 src/threadtrace/runtime/host.py
 src/threadtrace/runtime/launcher.py
 src/threadtrace/runtime/session.py

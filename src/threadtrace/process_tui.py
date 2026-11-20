@@ -19,7 +19,7 @@ from .processes import process_tree, running_python_processes, stop_process_tree
 
 
 class ProcessApp:
-    """Select a process, inspect what Thread inferred, then choose a safe path."""
+    """Select a process, inspect what ThreadTrace inferred, then choose a safe path."""
 
     def __init__(self, engine: Engine, pid: int | None = None, timeout: int = 30, output_cap: int = 100_000) -> None:
         self.engine = engine
@@ -127,7 +127,7 @@ class ProcessApp:
         selected = self.processes[self.selected]
         root = selected.get("project_root")
         if not root:
-            self.status = "Thread could not infer a Python project root for this process, so it will not scan or restart it."
+            self.status = "ThreadTrace could not infer a Python project root for this process, so it will not scan or restart it."
             return None
         try:
             project = self.engine.add_project(root)
@@ -138,7 +138,7 @@ class ProcessApp:
             return None
 
     def _header_text(self) -> StyleAndTextTuples:
-        return [("class:title", " Thread Process Discovery"), ("", "     Enter review · s normal scan · r restart under debugger · Esc back · q quit")]
+        return [("class:title", " ThreadTrace Process Discovery"), ("", "     Enter review · s normal scan · r restart under debugger · Esc back · q quit")]
 
     def _status_text(self) -> StyleAndTextTuples:
         return [("", f" {self.status}")]
@@ -158,7 +158,7 @@ class ProcessApp:
 
     def _refresh_inspector(self) -> None:
         if not self.processes:
-            self.inspector.text = "Thread only lists Python interpreters owned by your current user. No process has been selected."
+            self.inspector.text = "ThreadTrace only lists Python interpreters owned by your current user. No process has been selected."
             return
         selected = self.processes[self.selected]
         descendants = process_tree(self.processes, selected["pid"])[1:]
@@ -170,9 +170,9 @@ class ProcessApp:
         if self.confirming:
             lines.extend([
                 "\nConfirmation\n",
-                "[s] Normal reverse engineering: register the inferred root if needed, scan it, then open Thread's normal explorer.\n\n",
-                "[r] Restart under debugger: scan the inferred root, terminate the selected current-user Python process and discovered Python descendants, then relaunch the exact command with its detected venv/PATH under Thread Runtime.\n\n",
-                "Thread cannot attach to this already-running interpreter in this release.\n",
+                "[s] Normal reverse engineering: register the inferred root if needed, scan it, then open ThreadTrace's normal explorer.\n\n",
+                "[r] Restart under debugger: scan the inferred root, terminate the selected current-user Python process and discovered Python descendants, then relaunch the exact command with its detected venv/PATH under ThreadTrace Runtime.\n\n",
+                "ThreadTrace cannot attach to this already-running interpreter in this release.\n",
             ])
         else:
             lines.append("\nPress Enter to review actions. This screen does not execute, scan, or stop anything until you choose an action.\n")

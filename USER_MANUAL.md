@@ -36,6 +36,10 @@ uv venv
 uv pip install -e .
 ```
 
+Development extras add `pytest`: `uv pip install -e ".[dev]"`. ThreadTrace is
+verified on CPython 3.11; newer CPython releases and other interpreters keep
+their documented static-only status until they pass the same automated suite.
+
 Or, using regular Python tooling:
 
 ```console
@@ -69,7 +73,8 @@ threadtrace config init
 supports `storage` (database path, retention days, trace-saving policy, quota,
 usage reporting), `discovery` include/exclude globs, `profiles.default_interpreter`,
 `tui` preferences, loopback `browser` settings, `runtime` budgets and capture,
-`exports.default_format`, and local `ai` settings. Duplicate keys, unknown
+`exports.default_format`, and provider-independent `ai` settings (never
+credentials). Duplicate keys, unknown
 sections or fields, invalid types, secret-looking keys, and non-loopback
 browser hosts are rejected. The legacy top-level `database_path` key is still
 accepted and mapped to `storage.database_path`. Use `threadtrace config show` to
@@ -82,6 +87,8 @@ for that project. Preference content is validated and merged:
 threadtrace project preferences example-api
 threadtrace project preferences example-api \
   --content '{"discovery":{"exclude":["vendor/*"]},"tui":{"compact":true}}'
+threadtrace project preferences example-api \
+  --content '{"tui":{"keybindings":["overview=n","quit=z"]}}'
 ```
 
 Discovery include/exclude globs are applied by `scan`. Project preferences cannot
@@ -459,56 +466,83 @@ Launch the full-screen explorer after scanning:
 threadtrace tui PROJECT
 ```
 
-The explorer is built with `prompt_toolkit`, not Textual. It has a left
-navigation pane, a result list, and an inspector for source evidence, paths,
-library context, and AI-assisted explanations.
+The explorer is built with `prompt_toolkit`, not Textual. The normal layout has
+a left navigation pane, a result list, and an inspector for source evidence,
+paths, library context, and AI-assisted explanations. Below 80 columns or 20
+rows it switches to a compact single-pane layout; `Tab`/`Shift+Tab` switches
+between results and inspector there.
 
 | Key | Action |
 | --- | --- |
 | `o` | Overview |
-| `m` | Modules or linked files |
-| `c` | Classes or selected source |
+| `e` | Entrypoints |
+| `a` | Architecture |
+| `u` | Resources |
+| `f` | Functions |
+| `m` | Modules, or the linked-file map for the selected entry point |
+| `c` | Classes, or the selected source while browsing files or graphs |
 | `p` | Open the interactive File Graph, centred on the selected file when available |
 | `t` | Switch between File Graph and Code Graph while viewing a graph |
 | `j`/`k` or `Up`/`Down` | In a graph, move to a directly linked node |
 | `+`/`-` | In a graph, increase/decrease the number of visible relationship hops |
 | `[`/`]` | In a graph, narrow/broaden the confidence filter |
 | `,`/`.` | In a graph, cycle relationship types (import, direct call, contains, inheritance) |
-| `o` | Overview |
-| `e` | Entrypoints |
-| `a` | Architecture |
-| `u` | Resources |
-| `f` | Functions (and later guided function explanation) |
 | `d`, `l`, `x` | Findings, libraries, import cycles |
+| `g` | Go to the selected symbol's stored definition |
+| `G` | List references to the selected symbol |
 | `/` | Search symbols and files |
-| `:` | Command palette |
+| `:` or `Ctrl-P` | Command palette |
 | `j`/`k` or arrows | Move selection |
 | `Tab` | Move focus between search, results, and inspector |
 | `PgUp`/`PgDn`, `Ctrl-B`/`Ctrl-F` | Scroll the focused inspector |
-| `v` | Open the selected result's source file full screen |
+| `v` | Open the selected result's source file full screen at its recorded line |
 | `z` | Open the selected result's complete analysis full screen |
+| `y` | Open a lesson card for the selected function, method, or class |
 | Mouse wheel | Scroll panes where supported by the terminal |
-| `r` | Rescan |
-| `?` | Show the key summary |
+| `r` | Rescan and stay on the same view and selected result |
+| `?` | Open the complete key, command, and display summary |
 | `Backspace` | Return to overview |
 | `q` or `Ctrl-C` | Quit |
 
 The results and inspector panes show scrollbars. Press `Tab` until the inspector
 has focus, then use arrows, `PgUp`/`PgDn`, `Ctrl-B`/`Ctrl-F`, or the mouse wheel
-to read all of a long explanation. In the command palette, use:
+to read all of a long explanation.
 
-```text
-:overview
-:entrypoints
-:architecture
-:resources
-:scan
-:ai
-:quit
+Every important action also has a command. Press `:` or `Ctrl-P` to open the
+palette; keep typing to narrow the list and press `Enter` to run the selected
+command. Available commands include `:overview`, `:entrypoints`,
+`:architecture`, `:resources`, `:modules`, `:functions`, `:classes`,
+`:findings`, `:libraries`, `:cycles`, `:file-graph`, `:code-graph`, `:source`,
+`:analysis`, `:lesson`, `:definition`, `:references`, `:search`, `:ai`,
+`:scan`, `:compact`, `:ascii`, `:colour`, `:help`, and `:quit`.
+
+### Layout, keys, and display modes
+
+The view and navigation keys in the table can be rebound with `tui.keybindings`,
+a list of `action=key` entries in the configuration file or per-project
+preferences. Actions are the command names above plus `search`, `command`,
+`rescan`, `help`, and `quit`. Unknown actions, malformed entries, and two
+actions bound to the same key are rejected when the explorer starts. Graph
+(`t`, `j`, `k`, `+`, `-`, `[`, `]`, `,`, `.`) and source-view keys (`F2`, `F3`,
+`Ctrl-S`, `Ctrl-R`, `F10`) remain fixed.
+
+```yaml
+tui:
+  compact: false
+  ascii: false
+  colour: true
+  keybindings: [overview=n, quit=z]
 ```
 
-`Enter` keeps the selected item's inspector current. `:ai` requests an Ollama explanation for the selected symbol,
-entry point, library, or overview.
+`compact: true` always uses the single-pane layout. `ascii: true` replaces
+Unicode graph and selection characters with ASCII, and `colour: false` removes
+colour highlighting. Colour is never the only status cue: the status bar always
+begins with `INFO`, `OK`, `WARN`, or `FAIL`, and the selected row has a visible
+marker. The same modes can be toggled at runtime with `:compact`, `:ascii`, and
+`:colour`.
+
+`:ai` requests an Ollama explanation for the selected symbol, entry point,
+library, or overview. The explorer never imports or executes the target project.
 
 ### Relationship graphs
 
@@ -552,11 +586,24 @@ Source files open read-only by default. In a source view:
 
 ThreadTrace only enables editor writes for a file resolved inside the registered
 project root. Definition saves splice only that definition back into the source
-file. Before every save, ThreadTrace checks that the on-disk file still has the same
-content it opened; if another editor changed it, ThreadTrace refuses the save rather
-than overwriting those changes. Saving never executes code, but it makes the
-current analysis snapshot stale until you rescan. Use `Ctrl-R` to save and
-refresh in one step.
+file. A save runs in four explicit steps:
+
+1. The complete resulting file is parsed with Python's AST parser. A syntax
+error refuses the save and reports its line; nothing is written.
+2. The on-disk file is hashed and compared with the content opened earlier. If
+another editor changed it, ThreadTrace refuses the save rather than overwriting
+those changes.
+3. A read-only unified diff is shown. Use `y` or `Enter` to confirm, or `n`/
+`Esc` to cancel.
+4. The confirmed content is written to a temporary file in the same directory,
+flushed, and moved into place atomically. A failed write leaves the original
+file untouched and removes the temporary file.
+
+Saving never executes the target code, but it makes the current analysis
+snapshot stale until you rescan. Use `Ctrl-R` to save, rescan, and return to the
+view and selected result you were using. `r` also rescans in place, preserving
+that location. `F10` discards unsaved edits, and `Esc` refuses to close a source
+view that still has unsaved changes.
 
 ## Local browser companion
 
@@ -574,6 +621,25 @@ the terminal that started it to stop the server. The local server handles one
 request at a time so its SQLite connection always remains on the serving
 thread; browser requests may briefly queue behind one another.
 
+The page renders dependency/import, call, class/module, AST, data-flow,
+control-flow, and evidence-supported execution-flow graphs from the latest
+completed scan. Choose a family, enter a module, qualified symbol, or entry
+point, and press **Load graph**. Drag to pan, use the wheel to zoom, and
+double-click a node to focus on it. The label, relationship-type, and evidence
+filters narrow the current view; **Load more** appends another bounded page
+instead of stopping at a hard graph-size cutoff. **Find** searches stored
+modules and symbols and can switch the graph family and target.
+
+Select a node or relationship to see its evidence class, source location,
+capability status, and staleness. **Open source** reads only a bounded window
+from a file inside the registered project; it never executes the target.
+**Export Mermaid** downloads the same filtered graph, with node and edge
+references validated before rendering.
+
+Requests must come from the bound loopback address with a matching `Host` and
+same-origin `Origin`; write methods are rejected. The view is read-only and
+never runs, edits, or controls the project.
+
 Use `threadtrace capabilities example-api` to see which feature areas are
 currently Full, Partial, or Unsupported before relying on a result. Scope the
 report to stored evidence with `--scan SCAN_ID`, `--run TRACE_ID`,
@@ -581,40 +647,96 @@ report to stored evidence with `--scan SCAN_ID`, `--run TRACE_ID`,
 `Full` only when its tested boundary is verified; documented limitations remain
 attached to every capability item.
 
-## Ollama explanations
+## AI explanations
 
 AI narration is optional and disabled unless you explicitly request it. ThreadTrace
-uses a local Ollama server; it does not require an API key and does not send
-source code to an external provider.
+supports local Ollama and OpenAI-compatible providers. It never sends repository
+files, target source, or the environment; each request receives only a bounded,
+redacted subset of stored ThreadTrace facts.
 
-Start Ollama and ensure you have a model:
+Start Ollama for a local model:
 
 ```console
 ollama serve
 ollama pull llama3.2
-```
-
-Then ask for an explanation:
-
-```console
 threadtrace explain example-api app.routes.create_user --ai
 threadtrace explain example-api app.routes.create_user --ai --ai-model qwen2.5:7b
 ```
 
-Configuration variables:
+Nonsecret provider settings live in `config.yaml`:
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `THREADTRACE_OLLAMA_MODEL` | `llama3.2` | Default model when `--ai-model` is absent. |
-| `THREADTRACE_OLLAMA_ENDPOINT` | `http://127.0.0.1:11434/api/chat` | Local Ollama chat endpoint. |
+```yaml
+ai:
+  provider: ollama          # ollama or openai
+  model: llama3.2
+  endpoint: null            # provider URL; localhost defaults apply
+  temperature: 0.2          # 0 to 2
+  generation_limit: 900     # maximum generated tokens
+  timeout_seconds: 45
+  key_env: THREADTRACE_AI_API_KEY
+  template_path: null       # optional template containing {facts}
+  parameters: []            # for example [top_p=0.9, seed=7]
+```
 
-ThreadTrace gives Ollama only a bounded JSON representation of persisted ThreadTrace
-facts: overview, the selected explanation target, library context, and recorded
-evidence. The prompt requires concise Markdown, source citations where facts
-have locations, and `unknown` for insufficient evidence.
+For an OpenAI-compatible endpoint, set the credential named by `key_env` in the
+environment (or a mode-0600 `.env` file in ThreadTrace's application directory)
+and point the endpoint at the provider:
 
-An AI answer is interpretation, not source of truth. Verify it against the
-linked source evidence before changing production code.
+```console
+threadtrace explain example-api app.routes.create_user --ai \
+  --ai-provider openai --ai-endpoint http://127.0.0.1:8080/v1/chat/completions \
+  --ai-model local-model
+```
+
+Credentials are never printed, stored, exported, or included in a prompt. A
+credential in an endpoint URL is rejected. The `.env` fallback must not be
+readable by group or others.
+
+Loopback endpoints (`127.0.0.1`, `::1`, `localhost`) are local. Every remote
+request requires approval of its exact redacted payload:
+
+```console
+# Prints the payload, manifest, and SHA-256 digest to stderr; sends nothing.
+threadtrace explain example-api app.routes.create_user --ai \
+  --ai-provider openai --ai-endpoint https://api.example.com/v1/chat/completions --ai-show
+
+# Sends only if the digest matches the reviewed payload.
+threadtrace explain example-api app.routes.create_user --ai \
+  --ai-provider openai --ai-endpoint https://api.example.com/v1/chat/completions \
+  --ai-approve SHA256
+```
+
+On an interactive terminal a remote request prints the payload and asks you to
+type `approve`. A non-interactive request without the matching digest is refused.
+Redaction removes secret-looking fields and `password=`/`token:` style assignments
+from the outbound context; the manifest reports the redaction count, section sizes,
+provider, model, endpoint, and input limits.
+
+`--ai-temperature`, `--ai-tokens`, `--ai-template`, and repeatable
+`--ai-parameter NAME=VALUE` override the configured settings. Templates are
+limited to 20 KB and must contain `{facts}` exactly once. Unsupported provider
+parameters or invalid settings fail before any request.
+
+The provider must return JSON with a summary, claims carrying `path:line` evidence,
+and an optional Mermaid diagram. Every cited location must exist in the stored
+facts and every diagram node label must match a stored symbol or module. Invalid
+JSON, invented references, and malformed diagrams are rejected, so a provider
+cannot silently fabricate evidence.
+
+Each successful exchange persists the exact prompt, approved-context manifest,
+digest, validated response, provider/model/settings, timestamp, and evidence links
+in the local database. List and delete them with:
+
+```console
+threadtrace ai-history example-api
+threadtrace delete report example-api REPORT_KIND --yes
+```
+
+Deleting a scan through retention also removes the AI reports attached to it. In
+the explorer, `:ai` uses the configured provider but refuses remote endpoints
+because it cannot show an approval prompt; use the CLI for remote requests. Every
+AI answer is interpretation, not source of truth: verify it against the cited
+stored evidence before changing production code.
 
 ## Explicit runtime tracing
 
@@ -682,14 +804,26 @@ threadtrace trace-resources example-api TRACE_ID
 ```
 
 Runtime adapters observe supported `urllib`, `urllib3`, Requests, HTTPX, and
-aiohttp request boundaries; SQLite, SQLAlchemy, and Django database operations;
-file opens, reads, writes, creates, renames, deletions, and permission changes;
-and JSON/pickle serialisation. Safe wrappers emit a final `completed` or
-`failed` event only after the operation returns or raises. Audit-only evidence
-is labelled `attempted`; correlated audit and wrapper events share an ID.
-Events include duration, initiating project frame, and the available in-project
-call stack. Database rows and streaming HTTP response bodies are never consumed
-to capture them. `trace-resources` reports counts by status as well as failures.
+aiohttp request boundaries; Python-level TCP connects and FTP/FTPS command
+boundaries; SQLite, SQLAlchemy, and Django database operations; file opens,
+reads, writes, creates, renames, deletions, and permission changes; and
+JSON/pickle serialisation. TCP and FTP events are metadata boundaries only:
+TLS is not intercepted and payloads are not decrypted. Safe wrappers emit a
+final `completed` or `failed` event only after the operation returns or raises.
+Audit-only evidence is labelled `attempted`; correlated audit and wrapper
+events share an ID. Events include duration, initiating project frame, and the
+available in-project call stack. Database transaction, savepoint, release,
+commit, and rollback operations are visible where the driver exposes them;
+nested savepoint semantics remain Partial. Database rows and streaming HTTP
+response bodies are never consumed to capture them. `trace-resources` reports
+counts by status and failures, plus each adapter's installed version, tested
+minimum, support status, and observed operation count/duration.
+
+Before an explicitly requested `trace`, `runtime`, or `runtime-host` run,
+ThreadTrace prints a bounded static side-effect estimate from stored resource
+syntax. It is a best-effort summary, not a security guarantee: dynamic paths,
+indirect calls, and actual branch selection can add or remove effects. The same
+summary is stored with explicit traces under `preflight`.
 
 Inspect the concurrent timeline for any saved trace with:
 
@@ -961,6 +1095,7 @@ interactions are JSON-safe records that can be replayed or compared:
 
 ```console
 threadtrace experiment configure example-api validation-change --config '{"substitutions":[{"target":"app.validation:load_policy","mode":"return","value":{"allow":true}}],"seed":7}'
+threadtrace experiment preflight example-api validation-change
 threadtrace experiment call example-api validation-change app.validation:validate --args '[" Ada "]' --yes-run
 threadtrace experiment compare example-api validation-change app.validation:validate --args '[" Ada "]' --yes-run
 threadtrace experiment explore example-api validation-change app.validation:validate --yes-run
@@ -974,7 +1109,8 @@ threadtrace experiment remove example-api validation-change --yes
 Configuration supports `substitutions`, `patches`, `mocks`, `disabled_modules`,
 `overrides`, `argument_overrides`, `line_overrides`, `adapters`, `fixtures`,
 `setup_code`, `allow_expressions`, `input_generators`, `yield_cap`, `event_cap`,
-`environment`, `seed`, `freeze_time`, `uuid`, and `float_tolerance`. A
+`environment`, `seed`, `freeze_time`, `uuid`, `float_tolerance`, `interpreter`,
+and `budgets`. A
 substitution can return `None` or a selected/recorded value, raise a built-in
 exception, or pass through while recording arguments and the return.
 Mocks replace named imports with a JSON attribute object; `disabled_modules`
@@ -990,6 +1126,19 @@ updated when their identity can be resolved and every replacement is restored
 when the child experiment ends. `capability` identifies the selected callable
 form and reports interpreter-dependent limits such as closure-cell mutation or
 native implementation replacement instead of silently accepting them.
+
+Rule precedence is explicit per-call/per-experiment override, named
+patch/substitution, adapter mock/replay, then original behaviour. An override
+that shadows a lower rule is reported, and same-level collisions are rejected
+before execution: duplicate patch or substitution targets, patch plus
+substitution on one attribute, duplicate line overrides, and duplicate adapter
+selectors. `experiment preflight` validates a saved definition without running
+the project and reports that precedence, statically discovered pre-bound
+`from ... import ...` aliases, active-frame limits, the selected interpreter,
+and which replay inputs are controlled or remain uncontrolled. JSON runs
+include the same report. Set `interpreter` to run harness workers with a
+selected Python executable; comparison uses it for both sides and records the
+resolved interpreter.
 
 Inputs may be JSON literals or explicit typed/reusable values:
 
@@ -1026,21 +1175,39 @@ generators, coroutines, and async generators are completed by the harness.
 
 `adapters` supplies repeatable rules for HTTP (urllib and requests), SQLite,
 selected filesystem opens, socket connections, and subprocess starts. Rules
-can return HTTP status/headers/body/JSON or database rows, replace file content,
-block a process, and raise timeout, connection, permission, or unexpected
-errors. Mocked and pass-through operations are recorded. Every callable result
-also includes captured output, exception/traceback, execution steps, return,
-argument/object/global changes, workspace file creations/modifications/deletions,
-external operations, context, capability, and elapsed time.
+can return HTTP status/headers/body/JSON or database rows, replace read
+content, simulate latency, and raise timeout, connection, permission, missing
+file, or unexpected errors. A matched rule never silently performs the real
+operation: set `"pass_through": true` to allow it explicitly. Unmatched
+operations behave normally. Each adapter record uses runtime-compatible fields
+(`resource_kind`, `status`, `adapter_version`, `duration_seconds`, and `error`)
+so mocked, passed-through, completed, and failed operations remain
+distinguishable. Every callable result also includes captured output,
+exception/traceback, execution steps, return, argument/object/global changes,
+workspace file creations/modifications/deletions, external operations, context,
+capability, peak child memory, and elapsed time.
 
-Input exploration derives nominal, boundary, empty, invalid, negative, large,
-and unexpected-type values from the callable signature. `--cases` accepts an
-explicit JSON list of `{label, args, kwargs}` records, while `input_generators`
-adds reviewed experiment-mode generators. Cases producing distinct returns,
-exceptions, paths, crashes, timeouts, or side effects are retained.
+Input exploration derives deterministic nominal, boundary, empty, invalid,
+negative, large, and unexpected-type values from the callable signature.
+`--cases` accepts an explicit JSON list of `{label, args, kwargs}` records,
+while syntax-checked `input_generators` are labelled as explicit experiment
+execution. Cases producing distinct returns, exceptions, paths, crashes,
+timeouts, or side effects are retained as minimal `{case, reasons, signature}`
+records. `budgets` bounds exploration with `max_cases`, `global_timeout`,
+`case_timeout`, `max_events`, `max_output`, `max_memory_bytes`, and
+`max_storage_bytes`; the result reports executed/truncated counts, peak memory,
+stored bytes, and why collection stopped. Coverage-guided and general fuzzing
+remain later/experimental.
 
 Replay uses the exact saved inputs and experiment controls, runs a confirmation
-execution, and reports observed nondeterminism. At experiment creation,
+execution, and reports observed nondeterminism. Its `replay` record lists the
+controlled inputs (random seed, frozen time, UUID, environment) and every input
+that stays uncontrolled, such as thread scheduling, existing random instances,
+OS entropy, monotonic time, external state, object identity, and native code.
+Harness and workspace commands run in their own process group; a timeout kills
+the group and keeps bounded partial output. Capture and collection caps mark
+truncation, and a comparison reports `unknown` for truncated output, trace, or
+return values instead of claiming equality. At experiment creation,
 ThreadTrace records a content-hash manifest of the registered source. Comparison
 first verifies that source has not changed, then copies the registered baseline
 and selected modified workspace into separate temporary workspaces. Each side
@@ -1072,6 +1239,28 @@ of local names to replace before that line runs. This interface deliberately
 executes the selected copied project in the caller process; use the CLI/Engine
 child-process interface when process isolation is required.
 
+Stored results use a separate read-only interface that never scans, traces, or
+runs experiments:
+
+```python
+from threadtrace import ThreadTrace
+
+with ThreadTrace("/path/to/thread.sqlite3") as threadtrace:
+    project = threadtrace.project("example-api")
+    scan = threadtrace.latest_scan("example-api")
+    functions = threadtrace.query("functions", "example-api")
+    trace_ids = [trace["trace_id"] for trace in threadtrace.traces("example-api")]
+    bundle = threadtrace.export("example-api")
+```
+
+`ThreadTrace` accepts a database path or uses the configured one and exposes
+`projects`, `project`, `scans`, `latest_scan`, `traces`, `investigations`,
+`investigation`, the documented read-only `query` names (overview,
+architecture, findings, data flow, slices, traces, and similar), and `export`,
+which returns the same bundle the CLI writes. Query names outside that list
+raise an error instead of executing anything. Hybrid execution remains in
+`HybridHarness`.
+
 `experiment remove --yes` permanently removes only the private workspace and
 its saved run history. It verifies that the workspace is not the registered
 source directory before deletion.
@@ -1095,10 +1284,34 @@ resolved command, executable path, interpreter version, working directory,
 overridden and removed variable names, and any ThreadTrace instrumentation
 collisions. Values are not recorded.
 
-Use `threadtrace investigation save PROJECT NAME --content '{"notes":"..."}'`
-to persist a small JSON record of notes and selected references, and
-`threadtrace bookmark PROJECT TRACE_ID EVENT_NUMBER LABEL` to mark a recorded
-runtime event.
+Investigations record what you found and where:
+
+```console
+threadtrace investigation save example-api auth-flow --content '{"notes":"route calls the limiter","symbols":[{"path":"app/api.py","line":12,"qualified_name":"app.api.list_items"}],"hypotheses":[{"text":"limit is never enforced"}]}'
+threadtrace investigation list example-api
+threadtrace investigation show example-api auth-flow
+threadtrace investigation resume example-api auth-flow
+threadtrace investigation export example-api auth-flow --output auth-flow.json
+threadtrace investigation import example-api auth-flow.json --name auth-flow copy
+```
+
+An investigation stores `files`, `symbols`, `events`, `notes`, `hypotheses`,
+`graphs`, `relationships`, `traces`, `experiments`, and `bookmarks`. Each
+section is a list of objects or text; a bare note becomes `[{"text": ...}]`.
+Every referenced file, symbol, or event is captured with the current file
+hash, a bounded 40-line snippet, and a timestamp, so historical evidence
+survives later edits. Saving again keeps earlier captures and adds new ones.
+
+`resume` reopens the workspace against the latest completed scan and reports
+each reference as `unchanged`, `changed`, `moved`, or `missing` (a trace is
+reported as `available` or not) with warnings on stderr. Stored locations are
+never moved or silently refreshed. `export` writes a portable JSON artifact
+with the shared export envelope, the content, references, and warnings;
+`import` accepts that artifact, rejects an unknown newer export version, and
+warns when the saved source revision differs from the current project.
+
+Use `threadtrace bookmark PROJECT TRACE_ID EVENT_NUMBER LABEL` to mark a
+recorded runtime event.
 
 ## Exports and automation
 
@@ -1118,6 +1331,25 @@ Architecture additionally supports documentation-friendly graphs:
 threadtrace architecture example-api --format mermaid > architecture.mmd
 threadtrace architecture example-api --format dot > architecture.dot
 ```
+
+Produce one portable, versioned report of the latest completed scan:
+
+```console
+threadtrace export example-api --format json --output example-api.json
+threadtrace export example-api --format html --output example-api.html
+threadtrace export example-api --format mermaid
+```
+
+Every portable artifact starts with the same envelope: `format`,
+`export_version`, application/database/trace versions, `payload_type`,
+generation time, project and scan identifiers, run IDs, source file and
+scan-input hashes, capability status, limitations, and stored truncation
+markers. `export` defaults to JSON and supports JSON, Markdown, CSV, HTML,
+Mermaid, and DOT. JSON is the machine-readable form; HTML is self-contained
+and escapes target-controlled content; the other formats carry the envelope as
+a metadata section or comment lines. Files written with `--output` use mode
+0600 where supported. Experiment and investigation exports use the same
+envelope.
 
 Interactive commands such as `runtime`, `runtime-host`, `runtime-listen`,
 `process`, `tui`, and `browser` accept only text; `experiment diff` accepts only
@@ -1185,7 +1417,7 @@ permissions where supported. SQLite uses WAL, foreign keys, a five-second busy
 timeout, and transactional writes for concurrent readers/writers.
 
 Application, database schema, trace protocol, and export schema versions are
-independent and included in experiment export metadata where relevant.
+independent and included in every portable export envelope.
 
 Experiment patches are syntax-checked before writing, written atomically, and
 recorded in a patch history with before/after hashes. `experiment diff` reports

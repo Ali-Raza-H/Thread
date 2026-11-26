@@ -3,7 +3,7 @@
 ThreadTrace 0.7.0-alpha.1 is a terminal-first, local static analysis tool for Python projects. It reads source with Python's AST parser and never imports or runs the project being analysed.
 
 See the complete [user manual](USER_MANUAL.md) for installation, every command,
-the terminal explorer, local Ollama explanations, runtime-tracing safety, and
+the terminal explorer, optional AI explanations, runtime-tracing safety, and
 troubleshooting.
 
 ThreadTrace is licensed under [GPL-3.0-only](LICENSE).
@@ -15,6 +15,11 @@ relationship is always labelled `confirmed`, `high`, `possible`, or `unknown`;
 ThreadTrace does not turn a dynamic Python guess into a fact.
 
 ## Quick start
+
+Install the development extras with `uv pip install -e ".[dev]"` to run the
+`pytest` suite. ThreadTrace is developed and tested on CPython 3.11; other
+Python versions retain their documented static-only status until they run the
+same suite.
 
 ```console
 threadtrace project add ~/code/example
@@ -54,11 +59,37 @@ Use `--format json` with query commands for machine-readable output. Scans are e
 
 ## Terminal explorer
 
+`threadtrace tui PROJECT` opens the keyboard-first explorer for the latest scan.
+It keeps a three-pane layout on normal terminals and falls back to a compact
+single pane below 80x20, supports configurable view keys with collision checks
+and a complete command palette, and offers Unicode/ASCII plus colour/no-colour
+modes with text status cues. Source views add syntax highlighting,
+definition/reference navigation, and editing that checks Python syntax, shows a
+diff, requires confirmation, verifies the opened file's hash, and writes
+atomically.
+
 Use `explain` for a concise evidence-grounded description and `compare` to
 compare two completed scan IDs. JSON is the stable integration format.
 Reports can also be exported as Markdown, CSV, self-contained HTML, Mermaid,
 or DOT where the selected result supports a graph. Unsupported command/format
 pairs fail with exit code 2 rather than falling back to text.
+
+## Investigations and exports
+
+`threadtrace export PROJECT` writes one portable report of the latest
+completed scan with a shared, versioned envelope (application, schema, and
+trace versions, project/scan IDs, source hashes, capability status,
+limitations, and truncation) in JSON, Markdown, CSV, HTML, Mermaid, or DOT.
+JSON remains the machine-readable form; HTML is self-contained and escaped.
+
+`threadtrace investigation save|show|resume|export|import` keeps files,
+symbols, events, notes, hypotheses, graphs, relationships, traces,
+experiments, and bookmarks with the hash, bounded snippet, and timestamp of
+every referenced location. Resume reports changed, moved, or missing
+references without relocating them, and exports round-trip across projects.
+The experimental read-only `threadtrace.ThreadTrace` facade exposes projects,
+scans, whitelisted queries, traces, investigations, and report exports;
+Hybrid execution stays in `HybridHarness`.
 
 ## Local browser companion
 
@@ -72,6 +103,14 @@ ThreadTrace binds only to `127.0.0.1` by default and prints a local URL for
 you to open in a browser of your choice. Use `--host ::1` for IPv6 loopback or
 `--port PORT` to choose a specific local port. The view presents stored static
 results only; it cannot run or control the target program.
+
+The graph explorer covers dependency/import, call, class/module, AST,
+data-flow, control-flow, and evidence-supported execution-flow views with pan,
+zoom, search, filters, focus, hop expansion, bounded source navigation, and
+Mermaid export. Large graphs load in pages, and selected nodes and edges show
+their evidence class, source location, capability status, truncation, and
+staleness. Loopback Host/Origin checks and GET-only handling keep the local
+server read-only.
 
 Run `threadtrace config init` to create the versioned nonsecret configuration
 for storage, discovery, TUI/browser preferences, runtime budgets, exports, and
@@ -91,27 +130,40 @@ adapters, generated inputs, deterministic replay, and behavioural comparison:
 ```console
 threadtrace experiment create example trial
 threadtrace experiment configure example trial --config '{"seed":7,"freeze_time":0}'
+threadtrace experiment preflight example trial
 threadtrace experiment call example trial app.core:run --args '["input"]' --yes-run
 threadtrace experiment compare example trial app.core:run --args '["input"]' --yes-run
 ```
 
-See the user manual for typed inputs, persistent instances, HTTP/SQLite/file
-adapters, line overrides, run replay, capability inspection, and export.
+Preflight reports rule precedence, pre-bound aliases, and remaining
+nondeterminism before a run. See the user manual for typed inputs, persistent instances, HTTP/SQLite/file
+adapters that deny unmatched replacements unless pass-through is explicit,
+exploration budgets, line overrides, interpreter selection, run replay,
+capability inspection, and export.
 
 ## Optional AI explanations
 
-ThreadTrace can ask a small local Ollama model to explain its *stored evidence*;
-it never automatically sends repository files or runs AI during scans. The
-response is labelled AI-assisted and instructed to cite source locations.
+ThreadTrace can ask a local Ollama or OpenAI-compatible provider to explain its
+*stored evidence*; it never automatically sends repository files or runs AI
+during scans. Requests carry only a bounded, redacted fact subset. Remote
+endpoints require approval of the exact payload digest (`--ai-show`, then
+`--ai-approve DIGEST`, or an interactive `approve`). Credentials come from the
+environment or a mode-0600 local `.env` and are never stored or prompted.
 
 ```console
 # Local Ollama (default model: llama3.2)
 threadtrace explain example app.routes.create_user --ai
 threadtrace explain example app.routes.create_user --ai --ai-model qwen2.5:7b
+
+# Stored AI exchange history and explicit deletion
+threadtrace ai-history example
 ```
 
-Set `THREADTRACE_OLLAMA_ENDPOINT` to override Ollama's local URL. In the
-explorer, `:ai` requests an explanation for the selected result using Ollama.
+Providers must return validated JSON with source-cited claims and an optional
+Mermaid diagram; invented locations or symbols are rejected. Each exchange is
+labelled AI interpretation, persisted locally, and removable with
+`threadtrace delete report`. In the explorer, `:ai` uses the configured provider
+for local endpoints and refuses remote ones.
 
 ## Library context
 
@@ -153,10 +205,12 @@ shows calls, source lines, cycle-safe and identity-linked value summaries,
 exceptions, and bounded process output. `B` adds a read-only conditional
 breakpoint, `t` a tracepoint, and `w` a watchpoint; unsafe expressions are
 rejected. Breakpoints carry a source hash and step controls target the selected
-thread. Supported HTTP, SQLite/database, filesystem, and JSON/pickle boundaries
-appear in the same timeline with redacted metadata by default. Use `threadtrace trace-resources PROJECT TRACE_ID` for a saved
-side-effect timeline, or opt into bounded payload previews with
-`--capture-level content`. `trace-concurrency` correlates stable process,
+thread. Supported HTTP, Python-level TCP, FTP/FTPS, SQLite/database,
+filesystem, and JSON/pickle boundaries appear in the same timeline with
+redacted metadata by default. A static pre-run side-effect estimate is printed
+before execution but is not a safety guarantee. Use `threadtrace trace-resources PROJECT TRACE_ID` for a saved
+side-effect timeline, adapter versions/status, and observed per-adapter timing;
+opt into bounded payload previews with `--capture-level content`. `trace-concurrency` correlates stable process,
 thread, task, and observed wait identities across instrumented Python children;
 native locks, uninstrumented/non-Python children, and races remain explicitly
 unobserved. Runtime mode executes code and is not a security sandbox.

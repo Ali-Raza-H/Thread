@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import builtins
 import contextlib
@@ -16,6 +17,7 @@ import json
 import os
 import random
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -40,6 +42,16 @@ def create_workspace(source: Path, destination_root: Path) -> Path:
     return destination
 
 
+def _file_metadata(path: Path) -> dict[str, Any]:
+    """Hash one file in fixed-size chunks so large files are never held in memory."""
+    digest, size = hashlib.sha256(), 0
+    with path.open("rb") as handle:
+        while chunk := handle.read(65_536):
+            digest.update(chunk)
+            size += len(chunk)
+    return {"kind": "file", "size": size, "sha256": digest.hexdigest()}
+
+
 def source_revision(root: Path) -> dict[str, Any]:
     """Hash the source tree copied into an experiment without following links."""
     root = root.resolve(strict=True)
@@ -52,13 +64,7 @@ def source_revision(root: Path) -> dict[str, Any]:
         if path.is_symlink():
             files[name] = {"kind": "symlink", "target": os.readlink(path)}
         elif path.is_file():
-            content = path.read_bytes()
-            files[name] = {
-                "kind": "file",
-                "size": len(content),
-                "sha256": hashlib.sha256(content).hexdigest(),
-                "mode": path.stat().st_mode & 0o777,
-            }
+            files[name] = {**_file_metadata(path), "mode": path.stat().st_mode & 0o777}
         elif path.is_dir():
             files[name] = {"kind": "directory", "mode": path.stat().st_mode & 0o777}
     encoded = json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
@@ -66,15 +72,6 @@ def source_revision(root: Path) -> dict[str, Any]:
 
 
 PREVIEW_LIMIT = 20_000
-
-
-def _file_metadata(path: Path) -> dict[str, Any]:
-    digest, size = hashlib.sha256(), 0
-    with path.open("rb") as handle:
-        while chunk := handle.read(65_536):
-            digest.update(chunk)
-            size += len(chunk)
-    return {"kind": "file", "size": size, "sha256": digest.hexdigest()}
 
 
 def _tree_files(root: Path) -> dict[str, dict[str, Any]]:
@@ -223,20 +220,54 @@ def workspace_diff(source: Path, workspace: Path) -> str:
     return "".join(rendered)
 
 
+def _terminate_group(process: subprocess.Popen[str]) -> None:
+    if os.name == "posix":
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    else:
+        with contextlib.suppress(OSError):
+            process.kill()
+
+
+def _bounded_run(command: list[str], timeout: int, cwd: Path | None = None, input_text: str | None = None,
+                 environment: dict[str, str] | None = None) -> tuple[int | None, str, str, bool]:
+    """Run a child in its own process group and kill the whole group on timeout."""
+    process = subprocess.Popen(
+        command, cwd=cwd, env=environment or os.environ.copy(), text=True, errors="replace",
+        stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=os.name == "posix",
+    )
+    try:
+        stdout, stderr = process.communicate(input_text, timeout=timeout)
+        return process.returncode, stdout, stderr, False
+    except subprocess.TimeoutExpired:
+        _terminate_group(process)
+        try:
+            stdout, stderr = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            stdout = stderr = ""
+        return None, stdout, stderr, True
+
+
+def _harness_command(interpreter: str | None) -> list[str]:
+    return [interpreter or sys.executable, "-c", "from threadtrace.hybrid import _worker; _worker()"]
+
+
+def _harness_environment() -> dict[str, str]:
+    """Keep the harness importable by a selected interpreter outside this installation."""
+    environment = os.environ.copy()
+    package_root = str(Path(__file__).resolve().parent.parent)
+    environment["PYTHONPATH"] = os.pathsep.join(filter(None, (package_root, environment.get("PYTHONPATH", ""))))
+    return environment
+
+
 def run_workspace(workspace: Path, command: list[str], timeout: int, output_cap: int) -> dict[str, Any]:
     if not command:
         raise ValueError("A command is required after '--'.")
     if timeout < 1 or output_cap < 1:
         raise ValueError("Timeout and output cap must be positive.")
     before, started = _filesystem_snapshot(workspace), time.monotonic()
-    try:
-        completed = subprocess.run(command, cwd=workspace, env=os.environ.copy(), text=True, errors="replace",
-                                   capture_output=True, timeout=timeout, check=False)
-        stdout, stderr, exit_code, timed_out = completed.stdout, completed.stderr, completed.returncode, False
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout or ""
-        stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr or ""
-        exit_code, timed_out = None, True
+    exit_code, stdout, stderr, timed_out = _bounded_run(command, timeout, workspace)
     return {"command": command, "workspace": str(workspace), "exit_code": exit_code, "timed_out": timed_out,
             "stdout": stdout[:output_cap], "stderr": stderr[:output_cap],
             "output_truncated": len(stdout) > output_cap or len(stderr) > output_cap,
@@ -244,50 +275,122 @@ def run_workspace(workspace: Path, command: list[str], timeout: int, output_cap:
             "side_effects": {"filesystem": _filesystem_changes(before, _filesystem_snapshot(workspace))}}
 
 
-def run_harness(workspace: Path, request: dict[str, Any], timeout: int = 30, output_cap: int = 100_000) -> dict[str, Any]:
+def run_harness(workspace: Path, request: dict[str, Any], timeout: int = 30, output_cap: int = 100_000,
+                interpreter: str | None = None) -> dict[str, Any]:
     if timeout < 1 or output_cap < 1:
         raise ValueError("Timeout and output cap must be positive.")
     payload = {"workspace": str(workspace.resolve()), "request": {**request, "output_cap": output_cap}}
-    try:
-        completed = subprocess.run([sys.executable, "-m", "threadtrace.hybrid"], input=json.dumps(payload), text=True,
-                                   capture_output=True, timeout=timeout, check=False)
-    except subprocess.TimeoutExpired:
+    exit_code, stdout, stderr, timed_out = _bounded_run(_harness_command(interpreter), timeout,
+                                                       input_text=json.dumps(payload), environment=_harness_environment())
+    if timed_out:
         return {"timed_out": True, "worker_error": "Callable harness timed out."}
     try:
-        result = json.loads(completed.stdout)
+        result = json.loads(stdout)
     except json.JSONDecodeError:
-        result = {"worker_error": "Callable harness did not return valid JSON.", "worker_stdout": completed.stdout[:output_cap]}
-    if completed.stderr:
-        result["worker_stderr"] = completed.stderr[:output_cap]
-    result.update({"worker_exit_code": completed.returncode, "timed_out": False})
+        result = {"worker_error": "Callable harness did not return valid JSON.", "worker_stdout": stdout[:output_cap]}
+    if stderr:
+        result["worker_stderr"] = stderr[:output_cap]
+    result.update({"worker_exit_code": exit_code, "timed_out": False})
     return result
 
 
 def generate_input_cases(workspace: Path, target: str, config: dict[str, Any], timeout: int,
-                         output_cap: int) -> list[dict[str, Any]]:
-    result = run_harness(workspace, {"action": "generate", "target": target, "config": config}, timeout, output_cap)
+                         output_cap: int, interpreter: str | None = None) -> list[dict[str, Any]]:
+    result = run_harness(workspace, {"action": "generate", "target": target, "config": config}, timeout, output_cap,
+                         interpreter)
     if result.get("exception"):
         raise ValueError(result["exception"]["message"])
     return result.get("cases", [])
 
 
+def _exploration_budgets(config: dict[str, Any], timeout: int, output_cap: int) -> dict[str, Any]:
+    budgets = config.get("budgets") if isinstance(config.get("budgets"), dict) else {}
+    return {
+        "max_cases": int(budgets.get("max_cases", 0)) or None,
+        "global_timeout": float(budgets["global_timeout"]) if "global_timeout" in budgets else None,
+        "case_timeout": int(min(timeout, budgets.get("case_timeout", timeout))),
+        "max_events": int(budgets.get("max_events", 0)) or None,
+        "max_output": int(budgets.get("max_output", output_cap)),
+        "max_memory_bytes": int(budgets.get("max_memory_bytes", 0)) or None,
+        "max_storage_bytes": int(budgets.get("max_storage_bytes", 0)) or None,
+    }
+
+
+def _has_side_effects(result: dict[str, Any]) -> bool:
+    effects = result.get("side_effects") or {}
+    filesystem = effects.get("filesystem") or {}
+    return any(filesystem.get(key) for key in ("created", "modified", "deleted")) or bool(effects.get("external_operations"))
+
+
+def _retention_reasons(result: dict[str, Any], signature: str, first: str | None) -> list[str]:
+    reasons = []
+    if result.get("timed_out"):
+        reasons.append("timeout")
+    if result.get("exception"):
+        reasons.append("exception")
+    if result.get("worker_error") or result.get("worker_exit_code") not in (0, None):
+        reasons.append("crash")
+    if _has_side_effects(result):
+        reasons.append("side effects")
+    if first is not None and signature != first:
+        reasons.append("distinct behaviour")
+    return reasons
+
+
 def explore_inputs(workspace: Path, target: str, cases: list[dict[str, Any]] | None, config: dict[str, Any],
-                   timeout: int, output_cap: int) -> dict[str, Any]:
-    selected = cases if cases is not None else generate_input_cases(workspace, target, config, timeout, output_cap)
-    results, distinct, seen = [], [], set()
+                   timeout: int, output_cap: int, interpreter: str | None = None) -> dict[str, Any]:
+    limits = _exploration_budgets(config, timeout, output_cap)
+    selected = cases if cases is not None else generate_input_cases(workspace, target, config, timeout, output_cap,
+                                                                   interpreter)
+    requested = len(selected)
+    selected = selected[:limits["max_cases"]] if limits["max_cases"] else selected
+    harness_config = {**config, "event_cap": min(int(config.get("event_cap", 10_000)), limits["max_events"])} \
+        if limits["max_events"] else config
+    deadline = time.monotonic() + limits["global_timeout"] if limits["global_timeout"] else None
+    results, distinct, seen, retained = [], [], set(), []
+    memory_peak = stored_bytes = 0
+    stopped_reason = "case_limit" if requested > len(selected) else None
+    first_signature = None
     for index, case in enumerate(selected):
+        if deadline is not None and time.monotonic() >= deadline:
+            stopped_reason = "global_timeout"
+            break
         if not isinstance(case, dict):
             raise ValueError("Each input case must be a JSON object.")
-        request = {"target": target, "args": case.get("args", []), "kwargs": case.get("kwargs", {}), "config": config}
-        result = run_harness(workspace, request, timeout, output_cap)
+        case_timeout = limits["case_timeout"]
+        if deadline is not None:
+            case_timeout = max(1, min(case_timeout, int(deadline - time.monotonic())))
+        request = {"target": target, "args": case.get("args", []), "kwargs": case.get("kwargs", {}),
+                   "config": harness_config}
+        result = run_harness(workspace, request, case_timeout, limits["max_output"], interpreter)
+        memory_peak = max(memory_peak, int(result.get("memory_bytes") or 0))
         record = {"index": index, "case": case, "result": result}
         results.append(record)
+        stored_bytes += len(json.dumps(record, default=str))
         signature = json.dumps(_behavior_signature(result), sort_keys=True, default=str)
         if signature not in seen:
+            reasons = _retention_reasons(result, signature, first_signature)
+            first_signature = first_signature or signature
             seen.add(signature)
             distinct.append(record)
+            if reasons:
+                retained.append({"index": index, "case": case, "reasons": reasons, "signature": signature})
+        if limits["max_memory_bytes"] and memory_peak > limits["max_memory_bytes"]:
+            stopped_reason = "memory"
+            break
+        if limits["max_storage_bytes"] and stored_bytes > limits["max_storage_bytes"]:
+            stopped_reason = "storage"
+            break
     return {"target": target, "generated": cases is None, "results": results, "distinct_cases": distinct,
-            "crashes": [item for item in results if item["result"].get("exception") or item["result"].get("timed_out")],
+            "retained": retained,
+            "crashes": [item for item in results if item["result"].get("exception") or item["result"].get("timed_out")
+                        or item["result"].get("worker_error")],
+            "budgets": {"requested_cases": requested, "executed_cases": len(results),
+                        "cases_truncated": requested > len(selected), "case_timeout": limits["case_timeout"],
+                        "output_cap": limits["max_output"], "event_cap": harness_config.get("event_cap"),
+                        "max_memory_bytes": limits["max_memory_bytes"], "max_storage_bytes": limits["max_storage_bytes"],
+                        "memory_peak_bytes": memory_peak, "stored_bytes": stored_bytes,
+                        "stopped_reason": stopped_reason},
             "experimental": True}
 
 
@@ -297,6 +400,10 @@ def edge_cases() -> list[dict[str, Any]]:
             {"label": "negative", "args": [-1]}, {"label": "zero", "args": [0]},
             {"label": "large integer", "args": [10 ** 12]}, {"label": "empty list", "args": [[]]},
             {"label": "empty object", "args": [{}]}, {"label": "unexpected string", "args": ["unexpected"]}]
+
+
+def _canonical_target(target: str) -> str:
+    return target.replace(":", ".")
 
 
 def validate_experiment_config(config: dict[str, Any]) -> None:
@@ -311,8 +418,22 @@ def validate_experiment_config(config: dict[str, Any]) -> None:
         targets = [rule.get("target") for rule in config.get(name, []) if isinstance(rule, dict)]
         if len(targets) != len(config.get(name, [])) or any(not target for target in targets):
             raise ValueError(f"Every {name[:-1]} rule needs a target.")
-        if len(targets) != len(set(targets)):
+        if len(targets) != len({_canonical_target(target) for target in targets}):
             raise ValueError(f"Conflicting {name} target the same attribute.")
+    collisions = ({_canonical_target(rule["target"]) for rule in config.get("patches", [])}
+                  & {_canonical_target(rule["target"]) for rule in config.get("substitutions", [])})
+    if collisions:
+        raise ValueError(f"Patches and substitutions target the same attribute: {', '.join(sorted(collisions))}.")
+    line_overrides = config.get("line_overrides", [])
+    for rule in line_overrides:
+        if not isinstance(rule, dict) or not isinstance(rule.get("line"), int) or rule["line"] < 1:
+            raise ValueError("Every line override needs a positive line number.")
+        for field in ("locals", "globals"):
+            if field in rule and not isinstance(rule[field], dict):
+                raise ValueError(f"Line override {field} must be an object.")
+    selectors = [(rule.get("path"), rule["line"], rule.get("function")) for rule in line_overrides]
+    if len(selectors) != len(set(selectors)):
+        raise ValueError("Conflicting line overrides target the same path, line, and function.")
     for rule in config.get("patches", []):
         code = rule.get("code")
         if not isinstance(code, str):
@@ -334,9 +455,39 @@ def validate_experiment_config(config: dict[str, Any]) -> None:
         rules = raw_rules if isinstance(raw_rules, list) else [raw_rules]
         if not all(isinstance(rule, dict) for rule in rules):
             raise ValueError(f"{adapter} adapter rules must be objects.")
-        selectors = [tuple(rule.get(field) for field in selector_fields[adapter]) for rule in rules]
-        if len(selectors) != len(set(selectors)):
+        adapter_selectors = [tuple(rule.get(field) for field in selector_fields[adapter]) for rule in rules]
+        if len(adapter_selectors) != len(set(adapter_selectors)):
             raise ValueError(f"Conflicting {adapter} adapter rules use the same selector.")
+        for rule in rules:
+            if "latency" in rule and (not isinstance(rule["latency"], (int, float)) or isinstance(rule["latency"], bool)
+                                       or rule["latency"] < 0):
+                raise ValueError(f"{adapter} adapter latency must be a non-negative number.")
+            if "pass_through" in rule and not isinstance(rule["pass_through"], bool):
+                raise ValueError(f"{adapter} adapter pass_through must be true or false.")
+            if rule.get("pass_through") and (rule.get("error") or rule.get("block")):
+                raise ValueError(f"{adapter} adapter rules cannot pass through and fail or block together.")
+    for generator in config.get("input_generators", []):
+        if not isinstance(generator, dict) or not isinstance(generator.get("expression"), str) or not generator["expression"].strip():
+            raise ValueError("Every input generator needs an expression.")
+        try:
+            compile(generator["expression"], "<ThreadTrace input generator>", "eval")
+        except SyntaxError as exc:
+            raise ValueError(f"Input generator syntax error: {exc.msg}") from exc
+    if "budgets" in config:
+        budgets = config["budgets"]
+        if not isinstance(budgets, dict):
+            raise ValueError("budgets must be an object.")
+        unknown_budgets = set(budgets) - {"max_cases", "global_timeout", "case_timeout", "max_events",
+                                          "max_output", "max_memory_bytes", "max_storage_bytes"}
+        if unknown_budgets:
+            raise ValueError(f"Unsupported budget field(s): {', '.join(sorted(unknown_budgets))}.")
+        for name, value in budgets.items():
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"budgets.{name} must be a positive number.")
+    if "seed" in config and not isinstance(config["seed"], (int, float, str, bytes)):
+        raise ValueError("seed must be an int, float, string, or bytes.")
+    if "interpreter" in config and (not isinstance(config["interpreter"], str) or not config["interpreter"].strip()):
+        raise ValueError("interpreter must be a non-empty executable path.")
     if "freeze_time" in config:
         float(config["freeze_time"])
     if "uuid" in config:
@@ -344,6 +495,97 @@ def validate_experiment_config(config: dict[str, Any]) -> None:
     for name in ("yield_cap", "event_cap"):
         if name in config and (not isinstance(config[name], int) or config[name] < 1):
             raise ValueError(f"{name} must be a positive integer.")
+
+
+def replay_report(config: dict[str, Any]) -> dict[str, Any]:
+    """Record controlled inputs and every nondeterministic input left uncontrolled."""
+    controlled: list[dict[str, Any]] = []
+    if "seed" in config:
+        controlled.append({"input": "random", "control": f"random.seed({config['seed']})",
+                           "scope": "module-level random functions"})
+    if "freeze_time" in config:
+        controlled.append({"input": "time", "control": f"time.time() and datetime now/today return {float(config['freeze_time'])}",
+                           "scope": "time and datetime module attributes plus loaded project aliases"})
+    if "uuid" in config:
+        controlled.append({"input": "uuid", "control": f"uuid.uuid4() returns {config['uuid']}",
+                           "scope": "uuid.uuid4 module attribute plus loaded project aliases"})
+    if config.get("environment"):
+        controlled.append({"input": "environment", "control": f"set or removed for the run: {', '.join(sorted(config['environment']))}",
+                           "scope": "process environment"})
+    uncontrolled = [
+        {"input": "thread, process, and async scheduling", "reason": "Interleaving is observed, not replayed."},
+        {"input": "random.Random and third-party generator instances", "reason": "Seeding module functions does not reset existing instances."},
+        {"input": "os.urandom, secrets, and hash randomisation", "reason": "OS entropy and interpreter hash seeds are not intercepted."},
+        {"input": "time.monotonic, perf_counter, and process time", "reason": "Only time.time and datetime class methods are frozen."},
+        {"input": "network, database, subprocess, and filesystem state", "reason": "Observed for comparison but replayed only when an adapter rule replaces it."},
+        {"input": "object identity, addresses, and garbage collection", "reason": "They may differ between runs and are compared by value where possible."},
+        {"input": "native extension state", "reason": "Python-level controls cannot observe C-level nondeterminism."},
+    ]
+    if "seed" not in config:
+        uncontrolled.insert(0, {"input": "random", "reason": "No seed is configured."})
+    return {"controlled": controlled, "uncontrolled": uncontrolled, "fully_controlled": not uncontrolled}
+
+
+def _prebound_aliases(workspace: Path, targets: list[str]) -> list[dict[str, Any]]:
+    """Find project imports that bind a rule target before the rule is applied."""
+    modules: dict[str, list[str]] = {}
+    for target in targets:
+        module, attribute = target.split(":", 1) if ":" in target else target.rsplit(".", 1)
+        modules.setdefault(module, []).append(attribute)
+    found: list[dict[str, Any]] = []
+    for path in sorted(workspace.rglob("*.py")):
+        if path.is_symlink() or any(part in DEFAULT_EXCLUDES for part in path.relative_to(workspace).parts):
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.level or node.module not in modules:
+                continue
+            for alias in node.names:
+                if alias.name in modules[node.module]:
+                    found.append({"target": f"{node.module}:{alias.name}", "module": node.module,
+                                  "path": path.relative_to(workspace).as_posix(),
+                                  "line": node.lineno, "bound_as": alias.asname or alias.name})
+    return found
+
+
+def experiment_preflight(workspace: Path, config: dict[str, Any]) -> dict[str, Any]:
+    """Validate an experiment and describe its rules without importing or executing the project."""
+    validate_experiment_config(config)
+    patches = {rule["target"] for rule in config.get("patches", [])}
+    substitutions = {rule["target"] for rule in config.get("substitutions", [])}
+    overrides = set(config.get("overrides", {}))
+    normalized = {name: {_canonical_target(target) for target in targets}
+                  for name, targets in (("override", overrides), ("patch", patches), ("substitution", substitutions))}
+    shadowed = [{"target": target, "winner": "override",
+                 "shadowed_rule": "patch" if _canonical_target(target) in normalized["patch"] else "substitution"}
+                for target in sorted(overrides)
+                if _canonical_target(target) in normalized["patch"] | normalized["substitution"]]
+    interpreter = config.get("interpreter")
+    return {
+        "status": "ready",
+        "rules": {"patches": sorted(patches), "substitutions": sorted(substitutions),
+                  "overrides": sorted(overrides), "adapters": sorted(config.get("adapters", {})),
+                  "line_overrides": len(config.get("line_overrides", []))},
+        "precedence": [
+            {"level": 1, "rule": "explicit per-call/per-experiment override", "wins_over": "named patch/substitution"},
+            {"level": 2, "rule": "named patch/substitution", "wins_over": "adapter mock/replay"},
+            {"level": 3, "rule": "adapter mock/replay", "wins_over": "original behaviour"},
+            {"level": 4, "rule": "original behaviour", "wins_over": None},
+        ],
+        "shadowed": shadowed,
+        "prebound_aliases": _prebound_aliases(workspace, sorted(patches | substitutions | overrides)),
+        "interpreter": {"executable": interpreter or sys.executable,
+                        "available": Path(interpreter).is_file() if interpreter else True},
+        "limits": [
+            "Rules apply to fresh imports, the selected callable, and identity-matched loaded project modules; already-active frames cannot change.",
+            "Line overrides reach traced project lines but may miss closure cells and optimised locals.",
+            "Capture caps mark truncation, and truncated comparisons report unknown instead of equality.",
+        ],
+        "replay": replay_report(config),
+    }
 
 
 def compare_runs(baseline: dict[str, Any], modified: dict[str, Any], float_tolerance: float = 1e-9) -> dict[str, Any]:
@@ -360,6 +602,12 @@ def compare_runs(baseline: dict[str, Any], modified: dict[str, Any], float_toler
     timing = {"baseline_seconds": baseline_time, "modified_seconds": modified_time, "comparable": False}
     if isinstance(baseline_time, (int, float)) and isinstance(modified_time, (int, float)):
         timing.update({"comparable": True, "difference_seconds": modified_time - baseline_time})
+    if baseline.get("output_truncated") or modified.get("output_truncated"):
+        unknown.append({"field": "stdout/stderr", "reason": "Captured output was truncated."})
+    if baseline.get("trace_truncated") or modified.get("trace_truncated"):
+        unknown.append({"field": "trace", "reason": "Trace events were truncated."})
+    if baseline.get("collection_truncated") or modified.get("collection_truncated"):
+        unknown.append({"field": "return_value", "reason": "Returned collections hit the harness cap."})
     return {"same_behaviour": not differences and not unknown, "differences": differences,
             "unknown_comparisons": unknown, "timing": timing,
             "baseline": _comparison_view(baseline), "modified": _comparison_view(modified)}
@@ -443,6 +691,8 @@ class HybridHarness:
     _mock_parent_restores: list[tuple[Any, str, Any]] = field(default_factory=list)
     _setup_complete: bool = False
     _adapters: AdapterController | None = None
+    preflight: dict[str, Any] = field(default_factory=dict)
+    _replay_aliases: list[tuple[Any, Any, dict[str, Any]]] = field(default_factory=list)
 
     def call(self, target: str, args: list[Any] | None = None, kwargs: dict[str, Any] | None = None,
              per_call: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -450,7 +700,8 @@ class HybridHarness:
             with self._controlled_environment(per_call):
                 return self._call_loaded(target, args, kwargs)
         except BaseException as exc:
-            return _failed_result(exc, self.interactions)
+            return {**_failed_result(exc, self.interactions), "preflight": self.preflight,
+                    "replay": replay_report(self.config)}
 
     def execute(self, operations: list[dict[str, Any]], per_call: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
@@ -459,7 +710,8 @@ class HybridHarness:
                 for operation in operations:
                     results.append(self._operation(operation, results))
         except BaseException as exc:
-            results.append(_failed_result(exc, self.interactions))
+            results.append({**_failed_result(exc, self.interactions), "preflight": self.preflight,
+                            "replay": replay_report(self.config)})
         for result in results:
             result.pop("_raw_return", None)
         return results
@@ -482,7 +734,9 @@ class HybridHarness:
                     raise ValueError("Each input generator needs an expression.")
                 generated = eval(generator["expression"], {"__builtins__": _safe_builtins()}, dict(self.fixtures))
                 for index, value in enumerate(generated):
-                    cases.append({"label": f"generator {index + 1}", **(value if isinstance(value, dict) else {"args": [value]})})
+                    case = value if isinstance(value, dict) else {"args": [value]}
+                    cases.append({"label": f"generator {index + 1}", **case,
+                                  "generator": "advanced expression", "execution": "explicit experiment execution"})
             return cases
 
     def capability(self, target: str) -> dict[str, Any]:
@@ -565,10 +819,12 @@ class HybridHarness:
         exception, value = None, None
         try:
             with tracer, contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                value = _complete_value(callable_object(*decoded_args, **decoded_kwargs), int(self.config.get("yield_cap", 1_000)))
+                value, collection_truncated = _complete_value(callable_object(*decoded_args, **decoded_kwargs),
+                                                             int(self.config.get("yield_cap", 1_000)))
         except BaseException as exc:
             exception = exc
         result = {"return_value": _safe_value(value) if exception is None else None,
+                  "collection_truncated": exception is None and collection_truncated,
                   "exception": _exception_value(exception) if exception else None, **self._output(stdout.getvalue(), stderr.getvalue()),
                   "state": _safe_value(state_object) if state_object is not None else None,
                   "state_changes": {"before": state_before, "after": _safe_value(state_object)} if state_object is not None else None,
@@ -579,7 +835,8 @@ class HybridHarness:
                                    "external_operations": [item for item in self.interactions if item.get("kind") == "adapter"]},
                   "interactions": list(self.interactions), "trace": tracer.events,
                   "trace_truncated": tracer.truncated,
-                  "elapsed_seconds": time.monotonic() - started, "capability": capability,
+                  "elapsed_seconds": time.monotonic() - started, "memory_bytes": _memory_peak(), "capability": capability,
+                  "preflight": self.preflight, "replay": replay_report(self.config),
                   "context": {"signature": capability["signature"], "args": _safe_value(decoded_args),
                               "kwargs": _safe_value(decoded_kwargs), "fixtures": sorted(self.fixtures),
                               "mocked_modules": sorted(self.config.get("mocks", {})),
@@ -644,13 +901,14 @@ class HybridHarness:
     def _controlled_environment(self, per_call: dict[str, Any] | None = None) -> Iterator[None]:
         workspace, original_config = self.workspace.resolve(), self.config
         previous_cwd, old_path, original_modules, originals, old_environment = Path.cwd(), list(sys.path), {}, [], {}
-        modules_before = set(sys.modules)
+        modules_before, adapters = set(sys.modules), None
         if per_call:
             self.config = _merge_config(self.config, per_call)
         try:
             os.chdir(workspace)
             sys.path.insert(0, str(workspace))
             self._validate_config()
+            self.preflight = experiment_preflight(workspace, self.config)
             self._install_modules(original_modules)
             self._apply_environment(old_environment)
             random_state = random.getstate()
@@ -658,12 +916,14 @@ class HybridHarness:
                 random.seed(self.config["seed"])
             self._apply_replay_controls(originals)
             self._run_setup()
+            self._refresh_replay_aliases(originals)
+            adapters = AdapterController(workspace, self.config.get("adapters", {}), self.interactions)
+            self._adapters = adapters.__enter__()
             self._apply_rules(originals, "patches")
             self._apply_rules(originals, "substitutions")
             self._apply_overrides(originals)
-            with AdapterController(workspace, self.config.get("adapters", {}), self.interactions) as adapters:
-                self._adapters = adapters
-                yield
+            self._report_aliases()
+            yield
         finally:
             self._adapters = None
             for owner, name, original in reversed(self._operation_restores):
@@ -677,6 +937,8 @@ class HybridHarness:
             self._mock_parent_restores.clear()
             for owner, name, original in reversed(originals):
                 setattr(owner, name, original)
+            if adapters is not None:
+                adapters.__exit__(None, None, None)
             for name, previous in original_modules.items():
                 sys.modules.pop(name, None) if previous is _MISSING else sys.modules.__setitem__(name, previous)
             for name, previous in old_environment.items():
@@ -723,11 +985,13 @@ class HybridHarness:
             os.environ.pop(name, None) if value is None else os.environ.__setitem__(name, str(value))
 
     def _apply_replay_controls(self, originals: list[tuple[Any, str, Any]]) -> None:
+        self._replay_aliases = []
         if "freeze_time" in self.config:
             timestamp = float(self.config["freeze_time"])
+            original_time = time.time
             _replace(originals, time, "time", lambda: timestamp)
-            frozen, original_datetime, original_date = (datetime_module.datetime.fromtimestamp(timestamp, datetime_module.UTC),
-                                                        datetime_module.datetime, datetime_module.date)
+            frozen = datetime_module.datetime.fromtimestamp(timestamp, datetime_module.UTC)
+            original_datetime, original_date = datetime_module.datetime, datetime_module.date
 
             class FrozenDateTime(original_datetime):
                 @classmethod
@@ -745,11 +1009,32 @@ class HybridHarness:
 
             _replace(originals, datetime_module, "datetime", FrozenDateTime)
             _replace(originals, datetime_module, "date", FrozenDate)
-            self.interactions.append({"kind": "replay_control", "target": "time", "value": timestamp})
+            interaction = {"kind": "replay_control", "target": "time", "value": timestamp, "aliases": []}
+            self.interactions.append(interaction)
+            self._replay_aliases.extend([(original_time, time.time, interaction),
+                                         (original_datetime, FrozenDateTime, interaction),
+                                         (original_date, FrozenDate, interaction)])
+            self._refresh_replay_aliases(originals)
         if "uuid" in self.config:
             value = uuid.UUID(str(self.config["uuid"]))
+            original_uuid4 = uuid.uuid4
             _replace(originals, uuid, "uuid4", lambda: value)
-            self.interactions.append({"kind": "replay_control", "target": "uuid.uuid4", "value": str(value)})
+            interaction = {"kind": "replay_control", "target": "uuid.uuid4", "value": str(value), "aliases": []}
+            self.interactions.append(interaction)
+            self._replay_aliases.append((original_uuid4, uuid.uuid4, interaction))
+            self._refresh_replay_aliases(originals)
+
+    def _refresh_replay_aliases(self, originals: list[tuple[Any, str, Any]]) -> None:
+        for original, replacement, interaction in self._replay_aliases:
+            interaction["aliases"].extend(_replace_aliases(original, replacement, self.workspace, originals))
+
+    def _report_aliases(self) -> None:
+        resolved = {alias for interaction in self.interactions for alias in interaction.get("aliases", [])}
+        self.preflight["resolved_aliases"] = sorted(resolved)
+        self.preflight["unresolved_prebound_aliases"] = [
+            item for item in self.preflight.get("prebound_aliases", [])
+            if f"{item['module']}:{item['bound_as']}" not in resolved
+        ]
 
     def _run_setup(self) -> None:
         if self._setup_complete:
@@ -787,9 +1072,12 @@ class HybridHarness:
     def _apply_overrides(self, originals: list[tuple[Any, str, Any]]) -> None:
         for target, value in self.config.get("overrides", {}).items():
             owner, name = _owner_and_name(target, self.workspace)
+            current, replacement = getattr(owner, name), self._decode(value, [])
             originals.append((owner, name, inspect.getattr_static(owner, name)))
-            setattr(owner, name, self._decode(value, []))
-            self.interactions.append({"kind": "override", "target": target, "value": _safe_value(value)})
+            setattr(owner, name, replacement)
+            aliases = _replace_aliases(current, replacement, self.workspace, originals)
+            self.interactions.append({"kind": "override", "target": target, "value": _safe_value(value),
+                                      "aliases": aliases})
 
 
 _MISSING = object()
@@ -895,17 +1183,17 @@ def _replace(restores: list[tuple[Any, str, Any]], owner: Any, name: str, value:
     setattr(owner, name, value)
 
 
-def _complete_value(value: Any, cap: int) -> Any:
+def _complete_value(value: Any, cap: int) -> tuple[Any, bool]:
     if inspect.isawaitable(value):
-        return asyncio.run(value)
+        return asyncio.run(value), False
     if inspect.isasyncgen(value):
-        async def collect() -> list[Any]:
+        async def collect() -> tuple[list[Any], bool]:
             results = []
             async for item in value:
                 results.append(item)
                 if len(results) >= cap:
                     break
-            return results
+            return results, len(results) >= cap
         return asyncio.run(collect())
     if inspect.isgenerator(value):
         results = []
@@ -913,8 +1201,8 @@ def _complete_value(value: Any, cap: int) -> Any:
             results.append(item)
             if len(results) >= cap:
                 break
-        return results
-    return value
+        return results, len(results) >= cap
+    return value, False
 
 
 def _callable_capability(value: Any, target: str | None = None) -> dict[str, Any]:
@@ -1001,21 +1289,28 @@ def _dictionary_changes(before: dict[str, Any], after: dict[str, Any]) -> dict[s
             "removed": {name: before[name] for name in before.keys() - after.keys()}}
 
 
+def _memory_peak() -> int:
+    """Report the child's peak resident memory in bytes when the platform exposes it."""
+    try:
+        import resource
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except (ImportError, OSError):
+        return 0
+    return int(peak if sys.platform == "darwin" else peak * 1024)
+
+
 def _filesystem_snapshot(workspace: Path) -> dict[str, dict[str, Any]]:
+    """Hash workspace files in bounded chunks without holding their contents."""
     snapshot = {}
     for path in workspace.rglob("*"):
-        if path.is_symlink() or not path.is_file() or any(part in DEFAULT_EXCLUDES for part in path.relative_to(workspace).parts):
+        relative = path.relative_to(workspace)
+        if path.is_symlink() or not path.is_file() or any(part in DEFAULT_EXCLUDES for part in relative.parts):
             continue
         try:
-            descriptor = os.open(path, os.O_RDONLY)
-            chunks = []
-            while chunk := os.read(descriptor, 65_536):
-                chunks.append(chunk)
-            os.close(descriptor)
-            content = b"".join(chunks)
+            snapshot[relative.as_posix()] = _file_metadata(path)
         except OSError:
             continue
-        snapshot[path.relative_to(workspace).as_posix()] = {"size": len(content), "sha256": hashlib.sha256(content).hexdigest()}
     return snapshot
 
 
@@ -1034,17 +1329,47 @@ def _failed_result(exc: BaseException, interactions: list[dict[str, Any]]) -> di
             "interactions": list(interactions), "side_effects": {}, "trace": []}
 
 
+_TRUNCATION = "_threadtrace_truncation"
+
+
+def _truncation_marker(size: int, captured: int) -> dict[str, Any]:
+    return {"type": "truncation", "size": size, "captured": captured, "truncated": True}
+
+
 def _safe_value(value: Any, depth: int = 0) -> Any:
-    if depth > 5: return {"type": type(value).__name__, "summary": "depth limit", "comparable": "unknown"}
-    if value is None or isinstance(value, (bool, int, float)): return value
-    if isinstance(value, str): return value if len(value) <= 4_000 else {"type": "str", "length": len(value), "preview": value[:4_000]}
-    if isinstance(value, bytes): return {"type": "bytes", "length": len(value), "preview": value[:128].decode(errors="replace")}
-    if isinstance(value, (list, tuple)): return [_safe_value(item, depth + 1) for item in value[:100]]
-    if isinstance(value, (set, frozenset)): return {"type": type(value).__name__, "items": sorted((_safe_value(item, depth + 1) for item in value), key=str)[:100]}
-    if isinstance(value, dict): return {str(key): _safe_value(item, depth + 1) for key, item in list(value.items())[:100]}
+    if depth > 5:
+        return {"type": type(value).__name__, "summary": "depth limit", "comparable": "unknown", "truncated": True}
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value if len(value) <= 4_000 else {"type": "str", "length": len(value), "preview": value[:4_000],
+                                                         "truncated": True}
+    if isinstance(value, bytes):
+        return {"type": "bytes", "length": len(value), "preview": value[:128].decode(errors="replace"),
+                "truncated": len(value) > 128}
+    if isinstance(value, (list, tuple)):
+        items = [_safe_value(item, depth + 1) for item in value[:100]]
+        return items + ([_truncation_marker(len(value), 100)] if len(value) > 100 else [])
+    if isinstance(value, (set, frozenset)):
+        items = sorted((_safe_value(item, depth + 1) for item in value), key=str)[:100]
+        result = {"type": type(value).__name__, "items": items}
+        if len(value) > 100:
+            result[_TRUNCATION] = _truncation_marker(len(value), 100)
+        return result
+    if isinstance(value, dict):
+        result = {str(key): _safe_value(item, depth + 1) for key, item in list(value.items())[:100]}
+        if len(value) > 100:
+            result[_TRUNCATION] = _truncation_marker(len(value), 100)
+        return result
     state = getattr(value, "__dict__", None)
-    if isinstance(state, dict): return {"type": f"{type(value).__module__}.{type(value).__qualname__}", "attributes": _safe_value(state, depth + 1)}
+    if isinstance(state, dict):
+        return {"type": f"{type(value).__module__}.{type(value).__qualname__}", "attributes": _safe_value(state, depth + 1)}
     return {"type": f"{type(value).__module__}.{type(value).__qualname__}", "comparable": "unknown"}
+
+
+def _is_truncated(value: Any) -> bool:
+    return isinstance(value, dict) and (value.get("truncated") is True or _TRUNCATION in value
+                                        or value.get("comparable") == "unknown")
 
 
 def _comparison_view(result: dict[str, Any]) -> dict[str, Any]:
@@ -1059,7 +1384,7 @@ def _behavior_signature(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _structural_compare(before: Any, after: Any, tolerance: float) -> str:
-    if isinstance(before, dict) and before.get("comparable") == "unknown" or isinstance(after, dict) and after.get("comparable") == "unknown": return "unknown"
+    if _is_truncated(before) or _is_truncated(after): return "unknown"
     if isinstance(before, (int, float)) and isinstance(after, (int, float)) and not isinstance(before, bool) and not isinstance(after, bool): return "equal" if abs(float(before) - float(after)) <= tolerance else "different"
     if type(before) is not type(after): return "different"
     if isinstance(before, dict):
@@ -1087,9 +1412,19 @@ def _safe_builtins() -> dict[str, Any]:
 
 
 def _merge_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Apply per-call rules, letting each named replacement shadow the saved rule at the same target."""
     merged = dict(base)
     for name, value in override.items():
-        merged[name] = {**merged.get(name, {}), **value} if name in {"overrides", "argument_overrides", "environment", "fixtures", "adapters"} and isinstance(value, dict) else value
+        if name in {"overrides", "argument_overrides", "environment", "fixtures", "adapters"} and isinstance(value, dict):
+            merged[name] = {**merged.get(name, {}), **value}
+            continue
+        if name in {"patches", "substitutions"} and isinstance(value, list):
+            shadowed = {_canonical_target(rule["target"]) for rule in value
+                        if isinstance(rule, dict) and rule.get("target")}
+            other = "substitutions" if name == "patches" else "patches"
+            merged[other] = [rule for rule in merged.get(other, [])
+                             if _canonical_target(rule.get("target", "")) not in shadowed]
+        merged[name] = value
     return merged
 
 
@@ -1100,6 +1435,8 @@ def _worker() -> None:
         harness = HybridHarness(Path(payload["workspace"]), request.get("config", {}), int(request.get("output_cap", 100_000)))
         if request.get("action") == "generate": result = {"cases": harness.generate_cases(request["target"]), "exception": None}
         elif request.get("action") == "capability": result = {"capability": harness.capability(request["target"]), "exception": None}
+        elif request.get("action") == "preflight":
+            result = {"preflight": experiment_preflight(Path(payload["workspace"]), request.get("config", {})), "exception": None}
         elif "operations" in request: result = {"operations": harness.execute(request["operations"], request.get("per_call")), "instances": sorted(harness.instances), "interactions": harness.interactions}
         else:
             result = harness.call(request["target"], request.get("args"), request.get("kwargs"), request.get("per_call"))

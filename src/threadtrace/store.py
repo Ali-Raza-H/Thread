@@ -69,6 +69,10 @@ class Store:
         except (OSError, sqlite3.Error):
             return None
 
+    @property
+    def schema_version(self) -> int:
+        return int(self.connection.execute("PRAGMA user_version").fetchone()[0])
+
     def close(self) -> None:
         self.connection.close()
 

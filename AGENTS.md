@@ -19,15 +19,16 @@ documentation is `USER_MANUAL.md`.
 Create an environment and install the project in editable mode:
 
 ```console
-uv venv && uv pip install -e .
-# or: .venv/bin/python -m pip install -e .
+uv venv && uv pip install -e ".[dev]"
+# or: .venv/bin/python -m pip install -e ".[dev]"
 ```
 
-Run the full test suite with `python -m pytest`. Run a focused test while
-iterating with `python -m pytest tests/test_engine.py -k dataflow`. Check the
-CLI after installation with `threadtrace --help`. The project has no configured
-formatter, linter, or separate build command; avoid introducing one without
-documenting it in `pyproject.toml`.
+Run the full test suite with `python -m pytest` (or
+`python -m unittest discover -s tests`). Run a focused test while iterating with
+`python -m pytest tests/test_engine.py -k dataflow`. Check the CLI after
+installation with `threadtrace --help`. The project has no configured
+formatter or separate build command; avoid introducing one without documenting
+it in `pyproject.toml`.
 
 ## Coding Style & Naming Conventions
 
@@ -47,7 +48,10 @@ Add or extend `unittest.TestCase` tests for each behavior change. Name test
 methods `test_<behavior>` and use temporary project fixtures, as in
 `EngineTests.setUp`, so tests do not depend on local files or network access.
 Cover CLI output where applicable, including `--format json`; keep JSON output
-machine-readable.
+machine-readable. The `tests/test_gates.py` suite owns the offline fixture
+corpus, capability manifest, accuracy corpus, safety failures, and measured
+performance bounds; reference the tests it names in
+`src/threadtrace/test_evidence.py` when changing a capability claim.
 
 ## Commit & Pull Request Guidelines
 

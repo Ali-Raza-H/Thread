@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import contextvars
+import ftplib
 import functools
 import io
 import itertools
@@ -11,12 +12,19 @@ import json
 import os
 import pickle
 import re
+import socket
 import sqlite3
 import sys
 import threading
 import time
 import urllib.parse
 import urllib.request
+
+try:
+    from .adapter_versions import ADAPTERS, distribution_version as _distribution_version, version_tuple as _version_tuple
+except ImportError:  # Loaded as a copied top-level module inside a traced child.
+    from _threadtrace_runtime_adapter_versions import (ADAPTERS, distribution_version as _distribution_version,
+                                                       version_tuple as _version_tuple)
 
 _root = os.path.realpath(os.environ.get("THREADTRACE_RUNTIME_ROOT", ""))
 _log = os.environ.get("THREADTRACE_RUNTIME_LOG")
@@ -64,6 +72,43 @@ _environment_secrets = {
     value for key, value in os.environ.items()
     if len(value) >= 4 and any(word.replace("-", "_") in key.lower().replace("-", "_") for word in _sensitive)
 }
+
+_adapter_cache = None
+
+
+def statuses():
+    """Report installed versions and whether each adapter is safe to patch."""
+    global _adapter_cache
+    if _adapter_cache is not None:
+        return [dict(item) for item in _adapter_cache]
+    python_version = "%d.%d.%d" % sys.version_info[:3]
+    rows = []
+    for name, spec in ADAPTERS.items():
+        if name == "urllib":
+            version = python_version
+        elif name == "sqlite3":
+            version = getattr(sqlite3, "sqlite_version", python_version)
+        elif name in {"socket", "ftplib"}:
+            version = python_version
+        else:
+            version = _distribution_version(spec["package"])
+        if version is None:
+            status = "not installed"
+        elif _version_tuple(version) < _version_tuple(spec["minimum"]):
+            status = "unsupported"
+        else:
+            status = "supported"
+        rows.append({
+            "adapter": name, "version": version, "minimum": spec["minimum"],
+            "status": status,
+            "boundary": "metadata only; payload/TLS content is not inspected" if name in {"socket", "ftplib"} else None,
+        })
+    _adapter_cache = rows
+    return [dict(item) for item in rows]
+
+
+def _supported(name):
+    return any(item["adapter"] == name and item["status"] == "supported" for item in statuses())
 
 
 def _in_root(path):
@@ -255,6 +300,7 @@ def _publish(resource_kind, operation, started, details, error=None, origin=None
         "elapsed_seconds": time.monotonic() - _started_monotonic,
         "cpu_seconds": time.process_time() - _started_cpu,
         "duration_seconds": time.monotonic() - started,
+        "adapter_version": _adapter_version(details.get("adapter")) if isinstance(details, dict) else None,
         "capture": {"level": _level, "limit": _limit, "redacted": _redact},
         "details": details,
         "evidence_class": "observed at runtime",
@@ -392,24 +438,109 @@ def _patch_method(owner, name, wrapper):
     setattr(owner, name, replacement)
 
 
+def _adapter_version(name):
+    return next((item["version"] for item in statuses() if item["adapter"] == name), None)
+
+
+def _address_details(address):
+    host, port = None, None
+    if isinstance(address, tuple) and address:
+        host = address[0]
+        port = address[1] if len(address) > 1 else None
+    else:
+        host = address
+    return {"host": str(host)[:300], "port": port, "protocol": "tcp",
+            "tls": False, "tls_intercepted": False}
+
+
+def _socket_connect(original, operation):
+    @functools.wraps(original)
+    def wrapped(self, address):
+        origin = _origin()
+        started = time.monotonic()
+        details = {"adapter": "socket", **_address_details(address)}
+        try:
+            result = original(self, address)
+            error = OSError(result, os.strerror(result)) if operation == "connect_ex" and result else None
+            _publish("network", operation, started, details, error=error, origin=origin)
+            return result
+        except BaseException as error:
+            _publish("network", operation, started, details, error, origin)
+            raise
+    return wrapped
+
+
+def _patch_network():
+    if not _supported("socket"):
+        return
+    _patch_method(socket.socket, "connect", lambda fn: _socket_connect(fn, "connect"))
+    _patch_method(socket.socket, "connect_ex", lambda fn: _socket_connect(fn, "connect_ex"))
+
+
+def _ftp_operation(original, operation, fields):
+    @functools.wraps(original)
+    def wrapped(self, *args, **kwargs):
+        origin = _origin()
+        started = time.monotonic()
+        tls = isinstance(self, ftplib.FTP_TLS)
+        details = {"adapter": "ftplib", "protocol": "ftps" if tls else "ftp",
+                   "operation": operation, "tls": tls, "tls_intercepted": False}
+        for index, name in fields:
+            value = args[index] if len(args) > index else kwargs.get(name)
+            if value is not None and name not in {"password", "passwd", "acct"}:
+                details[name] = str(value)[:500]
+        try:
+            result = original(self, *args, **kwargs)
+            _publish("network", operation, started, details, origin=origin)
+            return result
+        except BaseException as error:
+            _publish("network", operation, started, details, error, origin)
+            raise
+    return wrapped
+
+
+def _patch_ftp():
+    if not _supported("ftplib"):
+        return
+    operations = {
+        "connect": ("host", "port"),
+        "login": ("user",),
+        "retrbinary": ("cmd",),
+        "retrlines": ("cmd",),
+        "storbinary": ("cmd",),
+        "storlines": ("cmd",),
+        "voidcmd": ("cmd",),
+        "delete": ("filename",),
+        "rename": ("fromname", "toname"),
+        "mkd": ("pathname",),
+        "rmd": ("pathname",),
+        "size": ("filename",),
+        "quit": (),
+    }
+    for name, fields in operations.items():
+        indexed = tuple((index, field) for index, field in enumerate(fields))
+        _patch_method(ftplib.FTP, name, lambda fn, operation=name, values=indexed:
+                      _ftp_operation(fn, operation, values))
+
+
 def _patch_http():
     _patch_method(urllib.request.OpenerDirector, "open", lambda fn: _sync_http("urllib", fn, 999, 1))
     requests = sys.modules.get("requests.sessions")
-    if requests:
+    if requests and _supported("requests"):
         _patch_method(getattr(requests, "Session", None), "request",
                       lambda fn: _sync_http("requests", fn, 1, 2))
     httpx = sys.modules.get("httpx")
-    if httpx:
+    if httpx and _supported("httpx"):
         _patch_method(getattr(httpx, "Client", None), "request",
                       lambda fn: _sync_http("httpx", fn, 1, 2))
         _patch_method(getattr(httpx, "AsyncClient", None), "request",
                       lambda fn: _async_http("httpx", fn, 1, 2))
     aiohttp = sys.modules.get("aiohttp.client")
-    if aiohttp:
+    if aiohttp and _supported("aiohttp"):
         _patch_method(getattr(aiohttp, "ClientSession", None), "_request",
                       lambda fn: _async_http("aiohttp", fn, 1, 2))
     urllib3 = sys.modules.get("urllib3.poolmanager")
-    if urllib3:
+    if urllib3 and _supported("urllib3"):
         _patch_method(getattr(urllib3, "PoolManager", None), "request",
                       lambda fn: _sync_http("urllib3", fn, 1, 2))
 
@@ -431,6 +562,7 @@ def _database_call(adapter, operation, database, statement, parameters, function
         result = function(*args, **kwargs)
         if depth == 0:
             in_transaction_after = getattr(connection, "in_transaction", None)
+            details["transaction"] = {"before": in_transaction_before, "after": in_transaction_after}
             if in_transaction_before is False and in_transaction_after is True:
                 _publish("database", "begin", started,
                          {"adapter": adapter, "database": _clean(database, "database")}, origin=origin)
@@ -468,12 +600,19 @@ def _database_fetch(cursor, operation, function, args=(), kwargs=None):
         raise
 
 
+def _sql_operation(sql):
+    match = re.match(r"\s*(savepoint|release|rollback\s+to|begin|commit|rollback)\b", str(sql), re.I)
+    if not match:
+        return "execute"
+    return re.sub(r"\s+", "_", match.group(1).lower())
+
+
 class _SQLiteCursor(sqlite3.Cursor):
     _threadtrace_statement = ""
 
     def execute(self, sql, parameters=()):
         self._threadtrace_statement = str(sql)
-        return _database_call("sqlite3", "execute", self.connection._threadtrace_database,
+        return _database_call("sqlite3", _sql_operation(sql), self.connection._threadtrace_database,
                               sql, parameters, super().execute, (sql, parameters), {})
 
     def executemany(self, sql, parameters):
@@ -545,7 +684,7 @@ def _connect(*args, **kwargs):
 
 def _patch_database_frameworks():
     sqlalchemy = sys.modules.get("sqlalchemy.engine.base")
-    if sqlalchemy:
+    if sqlalchemy and _supported("sqlalchemy"):
         for name in ("execute", "exec_driver_sql"):
             def factory(original, operation=name):
                 @functools.wraps(original)
@@ -566,7 +705,7 @@ def _patch_database_frameworks():
                 return wrapped
             _patch_method(getattr(sqlalchemy, "Connection", None), name, factory)
     django = sys.modules.get("django.db.backends.utils")
-    if django:
+    if django and _supported("django"):
         for name in ("execute", "executemany"):
             def factory(original, operation=name):
                 @functools.wraps(original)
@@ -577,7 +716,7 @@ def _patch_database_frameworks():
                 return wrapped
             _patch_method(getattr(django, "CursorWrapper", None), name, factory)
     django_base = sys.modules.get("django.db.backends.base.base")
-    if django_base:
+    if django_base and _supported("django"):
         for name in ("commit", "rollback"):
             def factory(original, operation=name):
                 @functools.wraps(original)
@@ -902,10 +1041,11 @@ def _import(name, globals=None, locals=None, fromlist=(), level=0):
     details = {"module": str(name), "fromlist": _clean(fromlist, "fromlist"), "level": level}
     try:
         module = _original_import(name, globals, locals, fromlist, level)
-        if name.split(".", 1)[0] in {"requests", "httpx", "aiohttp", "urllib3", "sqlalchemy", "django"}:
+        if name.split(".", 1)[0] in {"requests", "httpx", "aiohttp", "urllib3", "sqlalchemy", "django", "ftplib"}:
             try:
                 _patch_http()
                 _patch_database_frameworks()
+                _patch_ftp()
             except (AttributeError, TypeError):
                 pass
         if depth == 0 and origin is not None:
@@ -947,6 +1087,8 @@ def install():
     os.truncate = _filesystem_operation(_original_truncate, "truncate", "truncate", ("path",))
     builtins.__import__ = _import
     _patch_http()
+    _patch_network()
+    _patch_ftp()
     _patch_serialization()
     sys.addaudithook(_audit)
 

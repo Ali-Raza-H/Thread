@@ -23,7 +23,7 @@ DEFAULTS: dict[str, Any] = {
     },
     "discovery": {"include": [], "exclude": []},
     "profiles": {"default_interpreter": None},
-    "tui": {"compact": False, "ascii": False, "colour": True},
+    "tui": {"compact": False, "ascii": False, "colour": True, "keybindings": []},
     "browser": {"host": "127.0.0.1", "port": 0},
     "runtime": {
         "timeout_seconds": 30,
@@ -32,7 +32,11 @@ DEFAULTS: dict[str, Any] = {
         "capture_limit": 4096,
     },
     "exports": {"default_format": "text"},
-    "ai": {"provider": "ollama", "model": "llama3.2", "endpoint": None},
+    "ai": {
+        "provider": "ollama", "model": "llama3.2", "endpoint": None,
+        "temperature": 0.2, "generation_limit": 900, "timeout_seconds": 45,
+        "key_env": "THREADTRACE_AI_API_KEY", "template_path": None, "parameters": [],
+    },
 }
 
 _SCHEMA: dict[str, dict[str, tuple[str, Any]]] = {
@@ -45,7 +49,7 @@ _SCHEMA: dict[str, dict[str, tuple[str, Any]]] = {
     },
     "discovery": {"include": ("list", None), "exclude": ("list", None)},
     "profiles": {"default_interpreter": ("path", None)},
-    "tui": {"compact": ("bool", None), "ascii": ("bool", None), "colour": ("bool", None)},
+    "tui": {"compact": ("bool", None), "ascii": ("bool", None), "colour": ("bool", None), "keybindings": ("bindings", None)},
     "browser": {"host": ("choice", {"127.0.0.1", "::1"}), "port": ("int", 0)},
     "runtime": {
         "timeout_seconds": ("int", 1),
@@ -54,7 +58,13 @@ _SCHEMA: dict[str, dict[str, tuple[str, Any]]] = {
         "capture_limit": ("int", 1),
     },
     "exports": {"default_format": ("choice", {"text", "json", "markdown", "csv", "html"})},
-    "ai": {"provider": ("choice", {"ollama"}), "model": ("text", None), "endpoint": ("path", None)},
+    "ai": {
+        "provider": ("choice", {"ollama", "openai"}), "model": ("text", None),
+        "endpoint": ("path", None), "temperature": ("float", (0.0, 2.0)),
+        "generation_limit": ("int", 1), "timeout_seconds": ("int", 1),
+        "key_env": ("text", None), "template_path": ("path", None),
+        "parameters": ("parameters", None),
+    },
 }
 
 
@@ -83,6 +93,8 @@ def _scalar(value: str) -> Any:
         return [] if not inner else [item.strip().strip("\"'") for item in inner.split(",")]
     if value.isdecimal():
         return int(value)
+    if re.fullmatch(r"-?\d+\.\d+", value):
+        return float(value)
     return value.strip("\"'")
 
 
@@ -135,6 +147,27 @@ def _validate_value(name: str, value: Any, kind: str, constraint: Any) -> Any:
         if not isinstance(value, int) or isinstance(value, bool) or value < constraint:
             raise ValueError(f"{name} must be an integer from {constraint} upward.")
         return value
+    if kind == "float":
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(f"{name} must be a number.")
+        low, high = constraint
+        if not low <= float(value) <= high:
+            raise ValueError(f"{name} must be between {low} and {high}.")
+        return float(value)
+    if kind == "parameters":
+        if not isinstance(value, list):
+            raise ValueError(f"{name} must be a list of name=value parameters.")
+        seen: set[str] = set()
+        for item in value:
+            if not isinstance(item, str) or item.count("=") != 1:
+                raise ValueError(f"{name} entries must look like name=value.")
+            parameter, raw = (part.strip() for part in item.split("="))
+            if not re.fullmatch(r"[a-z][a-z0-9_]*", parameter) or not re.fullmatch(r"[!-~]{1,32}", raw):
+                raise ValueError(f"{name} entry '{item}' needs a lowercase parameter name and a printable value.")
+            if parameter in seen:
+                raise ValueError(f"{name} repeats parameter '{parameter}'.")
+            seen.add(parameter)
+        return value
     if kind == "choice":
         if value not in constraint:
             raise ValueError(f"{name} must be one of: {', '.join(sorted(constraint))}.")
@@ -142,6 +175,24 @@ def _validate_value(name: str, value: Any, kind: str, constraint: Any) -> Any:
     if kind == "list":
         if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
             raise ValueError(f"{name} must be a list of non-empty text values.")
+        return value
+    if kind == "bindings":
+        if not isinstance(value, list):
+            raise ValueError(f"{name} must be a list of action=key strings.")
+        actions: set[str] = set()
+        keys: set[str] = set()
+        for item in value:
+            if not isinstance(item, str) or item.count("=") != 1:
+                raise ValueError(f"{name} entries must look like action=key.")
+            action, key = (part.strip() for part in item.split("="))
+            if not re.fullmatch(r"[a-z][a-z0-9_-]*", action) or not re.fullmatch(r"[!-~]{1,8}", key):
+                raise ValueError(f"{name} entry '{item}' needs a lowercase action and one printable key.")
+            if action in actions:
+                raise ValueError(f"{name} repeats action '{action}'.")
+            if key in keys:
+                raise ValueError(f"{name} assigns key '{key}' more than once.")
+            actions.add(action)
+            keys.add(key)
         return value
     raise ValueError(f"Unsupported schema type for {name}.")
 
@@ -248,6 +299,7 @@ def write_default(path: Path | None = None, overwrite: bool = False) -> Path:
         "  compact: false\n"
         "  ascii: false\n"
         "  colour: true\n"
+        "  keybindings: []\n"
         "browser:\n"
         "  host: 127.0.0.1\n"
         "  port: 0\n"
@@ -261,7 +313,13 @@ def write_default(path: Path | None = None, overwrite: bool = False) -> Path:
         "ai:\n"
         "  provider: ollama\n"
         "  model: llama3.2\n"
-        "  endpoint: null\n",
+        "  endpoint: null\n"
+        "  temperature: 0.2\n"
+        "  generation_limit: 900\n"
+        "  timeout_seconds: 45\n"
+        "  key_env: THREADTRACE_AI_API_KEY\n"
+        "  template_path: null\n"
+        "  parameters: []\n",
         encoding="utf-8",
     )
     try:

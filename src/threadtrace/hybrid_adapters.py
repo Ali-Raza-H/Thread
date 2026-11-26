@@ -10,11 +10,15 @@ import re
 import socket
 import sqlite3
 import subprocess
+import sys
+import time
 import urllib.request
 import urllib.parse
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+
+from .adapter_versions import ADAPTERS as _ADAPTERS, distribution_version, python_version
 
 
 _LIMIT = 4096
@@ -69,24 +73,42 @@ class MockCursor:
 
     def execute(self, query: str, parameters: Any = ()) -> MockCursor:
         rule = self._controller.database_rule(query)
-        self._controller.record("database", "execute", query=query, parameters=parameters, mocked=bool(rule))
-        if rule:
+        entry = self._controller.record("database", "execute", query=query, parameters=parameters, mocked=bool(rule),
+                                        pass_through=_pass_through(rule))
+        started = time.monotonic()
+        try:
+            if rule is None or _pass_through(rule):
+                self._real.execute(query, parameters)
+                return self
+            _apply_latency(rule)
             _raise_rule_error(rule, "database")
             self._rows = list(rule.get("rows", []))
             return self
-        self._real.execute(query, parameters)
-        return self
+        except BaseException as exc:
+            self._controller.fail(entry, exc)
+            raise
+        finally:
+            entry["duration_seconds"] = round(time.monotonic() - started, 6)
 
     def executemany(self, query: str, parameters: Any) -> MockCursor:
         materialised = list(parameters)
         rule = self._controller.database_rule(query)
-        self._controller.record("database", "executemany", query=query, parameters=materialised, mocked=bool(rule))
-        if rule:
+        entry = self._controller.record("database", "executemany", query=query, parameters=materialised, mocked=bool(rule),
+                                        pass_through=_pass_through(rule))
+        started = time.monotonic()
+        try:
+            if rule is None or _pass_through(rule):
+                self._real.executemany(query, materialised)
+                return self
+            _apply_latency(rule)
             _raise_rule_error(rule, "database")
             self._rows = list(rule.get("rows", []))
             return self
-        self._real.executemany(query, materialised)
-        return self
+        except BaseException as exc:
+            self._controller.fail(entry, exc)
+            raise
+        finally:
+            entry["duration_seconds"] = round(time.monotonic() - started, 6)
 
     def fetchone(self) -> Any:
         if self._rows is None:
@@ -171,8 +193,21 @@ class AdapterController:
             replacement = getattr(owner, name)
             self._replace_project_aliases(original, replacement)
 
-    def record(self, adapter: str, operation: str, **details: Any) -> None:
-        self.interactions.append({"kind": "adapter", "adapter": adapter, "operation": operation, **_safe(details)})
+    def record(self, adapter: str, operation: str, **details: Any) -> dict[str, Any]:
+        """Record an adapter operation with the same field names as runtime evidence."""
+        pass_through = bool(details.get("pass_through"))
+        entry = {
+            "kind": "adapter", "resource_kind": adapter, "adapter": adapter, "operation": operation,
+            "status": "pass_through" if pass_through else "mocked" if details.get("mocked") else "completed",
+            "adapter_version": _adapter_version(adapter),
+            "evidence_class": "observed during an explicitly controlled experiment",
+            **_safe(details),
+        }
+        self.interactions.append(entry)
+        return entry
+
+    def fail(self, entry: dict[str, Any], exc: BaseException) -> None:
+        entry.update(status="failed", error={"type": type(exc).__name__, "message": _safe(str(exc))})
 
     def database_rule(self, query: str) -> dict[str, Any] | None:
         for rule in self._rules("database"):
@@ -202,14 +237,29 @@ class AdapterController:
             path = self._path(file)
             operation = "write" if any(flag in mode for flag in "wax+") else "read"
             rule = self._file_rule(path, operation)
-            if self._record_file(path, rule):
-                self.record("filesystem", operation, path=str(path), mode=mode, mocked=bool(rule))
-            if rule:
+            entry = self.record("filesystem", operation, path=str(path), mode=mode, mocked=bool(rule),
+                                pass_through=_pass_through(rule)) if self._record_file(path, rule) else None
+            if rule is None:
+                return original_open(file, mode, *args, **kwargs)
+            started = time.monotonic()
+            try:
+                _apply_latency(rule)
+                if _pass_through(rule):
+                    return original_open(file, mode, *args, **kwargs)
                 _raise_rule_error(rule, "filesystem")
-                if "content" in rule and operation == "read":
+                if rule.get("missing"):
+                    raise FileNotFoundError(str(path))
+                if operation == "read" and "content" in rule:
                     content = rule["content"]
                     return io.BytesIO(str(content).encode()) if "b" in mode else io.StringIO(str(content))
-            return original_open(file, mode, *args, **kwargs)
+                raise PermissionError("Filesystem rule replaced neither content nor the operation; set pass_through to allow it.")
+            except BaseException as exc:
+                if entry is not None:
+                    self.fail(entry, exc)
+                raise
+            finally:
+                if entry is not None:
+                    entry["duration_seconds"] = round(time.monotonic() - started, 6)
 
         self._patch(builtins, "open", open_file)
         self._patch(io, "open", open_file)
@@ -221,11 +271,22 @@ class AdapterController:
             url = getattr(request, "full_url", request)
             method = getattr(request, "method", None) or "GET"
             rule = self._http_rule(str(url), method)
-            self.record("http", method.upper(), url=str(url), mocked=bool(rule))
-            if rule:
+            entry = self.record("http", method.upper(), url=str(url), mocked=bool(rule),
+                                pass_through=_pass_through(rule))
+            started = time.monotonic()
+            try:
+                if rule is None:
+                    return original_urlopen(request, *args, **kwargs)
+                _apply_latency(rule)
+                if _pass_through(rule):
+                    return original_urlopen(request, *args, **kwargs)
                 _raise_rule_error(rule, "http")
                 return MockHttpResponse(rule)
-            return original_urlopen(request, *args, **kwargs)
+            except BaseException as exc:
+                self.fail(entry, exc)
+                raise
+            finally:
+                entry["duration_seconds"] = round(time.monotonic() - started, 6)
 
         self._patch(urllib.request, "urlopen", urlopen)
         try:
@@ -236,13 +297,24 @@ class AdapterController:
 
         def request(session: Any, method: str, url: str, **kwargs: Any) -> Any:
             rule = self._http_rule(url, method)
-            self.record("http", method.upper(), url=url, mocked=bool(rule), request=kwargs)
-            if rule:
+            entry = self.record("http", method.upper(), url=url, mocked=bool(rule), pass_through=_pass_through(rule),
+                                request=kwargs)
+            started = time.monotonic()
+            try:
+                if rule is None:
+                    return original_request(session, method, url, **kwargs)
+                _apply_latency(rule)
+                if _pass_through(rule):
+                    return original_request(session, method, url, **kwargs)
                 _raise_rule_error(rule, "http")
                 response = MockHttpResponse(rule)
                 response.url = url
                 return response
-            return original_request(session, method, url, **kwargs)
+            except BaseException as exc:
+                self.fail(entry, exc)
+                raise
+            finally:
+                entry["duration_seconds"] = round(time.monotonic() - started, 6)
 
         self._patch(requests.sessions.Session, "request", request)
 
@@ -260,10 +332,22 @@ class AdapterController:
 
         def create_connection(address: Any, *args: Any, **kwargs: Any) -> Any:
             rule = self._network_rule(address)
-            self.record("network", "connect", address=address, mocked=bool(rule))
-            if rule:
+            entry = self.record("network", "connect", address=address, mocked=bool(rule),
+                                pass_through=_pass_through(rule))
+            started = time.monotonic()
+            try:
+                if rule is None:
+                    return original_create(address, *args, **kwargs)
+                _apply_latency(rule)
+                if _pass_through(rule):
+                    return original_create(address, *args, **kwargs)
                 _raise_rule_error(rule, "network")
-            return original_create(address, *args, **kwargs)
+                raise PermissionError("Network connection blocked by experiment adapter; set pass_through to allow it.")
+            except BaseException as exc:
+                self.fail(entry, exc)
+                raise
+            finally:
+                entry["duration_seconds"] = round(time.monotonic() - started, 6)
 
         self._patch(socket, "create_connection", create_connection)
 
@@ -272,12 +356,22 @@ class AdapterController:
 
         def popen(command: Any, *args: Any, **kwargs: Any) -> Any:
             rule = self._process_rule(command)
-            self.record("process", "start", command=command, mocked=bool(rule))
-            if rule:
+            entry = self.record("process", "start", command=command, mocked=bool(rule),
+                                pass_through=_pass_through(rule))
+            started = time.monotonic()
+            try:
+                if rule is None:
+                    return original_popen(command, *args, **kwargs)
+                _apply_latency(rule)
+                if _pass_through(rule):
+                    return original_popen(command, *args, **kwargs)
                 _raise_rule_error(rule, "process")
-                if rule.get("block", False):
-                    raise PermissionError("Process start blocked by experiment adapter.")
-            return original_popen(command, *args, **kwargs)
+                raise PermissionError("Process start blocked by experiment adapter; set pass_through to allow it.")
+            except BaseException as exc:
+                self.fail(entry, exc)
+                raise
+            finally:
+                entry["duration_seconds"] = round(time.monotonic() - started, 6)
 
         self._patch(subprocess, "Popen", popen)
 
@@ -302,7 +396,6 @@ class AdapterController:
         return next((rule for rule in self._rules("process") if str(rule.get("command_contains", "")) in text), None)
 
     def _replace_project_aliases(self, original: Any, replacement: Any) -> None:
-        import sys
         for module in list(sys.modules.values()):
             if not isinstance(module, ModuleType) or not self._project_module(module):
                 continue
@@ -333,6 +426,26 @@ class AdapterController:
             return path.is_relative_to(self.workspace) and path.suffix not in {".py", ".pyc"}
         except OSError:
             return False
+
+
+def _pass_through(rule: dict[str, Any] | None) -> bool:
+    return bool(rule and (rule.get("pass_through") or rule.get("allow_real")))
+
+
+def _apply_latency(rule: dict[str, Any]) -> None:
+    if rule.get("latency"):
+        time.sleep(min(max(float(rule["latency"]), 0.0), 10.0))
+
+
+def _adapter_version(adapter: str) -> str | None:
+    """Reuse the runtime adapter's tested package bounds and version reporting."""
+    name = {"http": "urllib", "database": "sqlite3", "network": "socket"}.get(adapter)
+    spec = _ADAPTERS.get(name or "", {})
+    if spec.get("package"):
+        return distribution_version(spec["package"])
+    if name == "sqlite3":
+        return getattr(sqlite3, "sqlite_version", python_version())
+    return python_version()
 
 
 def _raise_rule_error(rule: dict[str, Any], adapter: str) -> None:

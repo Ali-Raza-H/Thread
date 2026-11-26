@@ -13,6 +13,7 @@ import stat
 import subprocess
 import tempfile
 import sys
+import threading
 import time
 import unittest
 from datetime import UTC, datetime
@@ -585,21 +586,347 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(process["exception"]["type"], "PermissionError")
             export_path = Path(self.temp.name) / "adapter-experiment.json"
             exported = self.engine.export_experiment("sample", "adapters", str(export_path))
-            self.assertEqual(exported["format_version"], 1)
+            self.assertEqual(exported["payload_type"], "experiment")
             self.assertEqual(exported["database_schema_version"], 17)
             self.assertEqual(exported["trace_protocol_version"], 1)
             self.assertTrue(exported["application_version"])
             self.assertEqual(stat.S_IMODE(export_path.stat().st_mode), 0o600)
-            self.assertTrue(exported["runs"])
-            self.assertEqual(json.loads(export_path.read_text())["experiment"], "adapters")
+            self.assertTrue(exported["payload"]["runs"])
+            self.assertEqual(exported["run_ids"], [run["run_id"] for run in exported["payload"]["runs"]])
+            self.assertEqual(json.loads(export_path.read_text())["payload"]["experiment"], "adapters")
+
+    def test_experiment_preflight_precedence_replay_controls_and_honest_truncation(self) -> None:
+        (self.root / "app" / "preflight_target.py").write_text(
+            "import urllib.request\n"
+            "from time import time as clock\n\n"
+            "def now():\n"
+            "    return clock()\n\n"
+            "def download():\n"
+            "    return urllib.request.urlopen('https://service.test/data').read()\n\n"
+            "def large():\n"
+            "    return list(range(150))\n\n"
+            "def streamed():\n"
+            "    for value in range(5_000):\n"
+            "        yield value\n"
+        )
+        (self.root / "app" / "preflight_user.py").write_text(
+            "from app.preflight_target import now\n\n"
+            "def current():\n"
+            "    return now()\n"
+        )
+        with patch("threadtrace.engine.application_directory", return_value=Path(self.temp.name) / "application"):
+            self.engine.create_experiment("sample", "preflight")
+            self.engine.configure_experiment("sample", "preflight", {
+                "substitutions": [{"target": "app.preflight_target:clock", "mode": "return", "value": 1}],
+                "patches": [{"target": "app.preflight_target:now", "code": "def replacement():\n    return 2"}],
+                "overrides": {"app.preflight_target:now": None},
+                "line_overrides": [{"path": "app/preflight_target.py", "line": 5, "locals": {"value": 1}}],
+                "adapters": {"http": [{"url_contains": "service.test", "body": "mock"}]},
+                "seed": 3, "freeze_time": 10.0, "uuid": "12345678-1234-5678-1234-567812345678",
+                "environment": {"TT_MODE": "controlled"}, "interpreter": sys.executable,
+            })
+            report = self.engine.experiment_preflight("sample", "preflight")
+            self.assertEqual(report["status"], "ready")
+            self.assertEqual([item["rule"] for item in report["precedence"]], [
+                "explicit per-call/per-experiment override", "named patch/substitution",
+                "adapter mock/replay", "original behaviour",
+            ])
+            self.assertEqual(report["shadowed"], [{"target": "app.preflight_target:now", "winner": "override",
+                                                   "shadowed_rule": "patch"}])
+            self.assertIn({"target": "app.preflight_target:now", "module": "app.preflight_target",
+                           "path": "app/preflight_user.py", "line": 1, "bound_as": "now"},
+                          report["prebound_aliases"])
+            self.assertEqual({item["input"] for item in report["replay"]["controlled"]},
+                             {"random", "time", "uuid", "environment"})
+            self.assertIn("os.urandom, secrets, and hash randomisation",
+                          {item["input"] for item in report["replay"]["uncontrolled"]})
+            self.assertFalse(report["replay"]["fully_controlled"])
+            self.assertTrue(report["interpreter"]["available"])
+            output = StringIO()
+            with redirect_stdout(output):
+                code = main(["experiment", "preflight", "sample", "preflight", "--database", str(self.store.path),
+                             "--format", "json"])
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output.getvalue())["rules"]["patches"], ["app.preflight_target:now"])
+            with self.assertRaisesRegex(ThreadError, "Patches and substitutions"):
+                self.engine.configure_experiment("sample", "preflight", {
+                    "patches": [{"target": "app.preflight_target:now", "code": "def replacement():\n    return 2"}],
+                    "substitutions": [{"target": "app.preflight_target:now", "mode": "return", "value": 3}],
+                })
+            with self.assertRaisesRegex(ThreadError, "Conflicting line overrides"):
+                self.engine.configure_experiment("sample", "preflight", {
+                    "line_overrides": [{"path": "app/preflight_target.py", "line": 5, "locals": {"value": 1}},
+                                       {"path": "app/preflight_target.py", "line": 5, "locals": {"value": 2}}],
+                })
+            with self.assertRaisesRegex(ThreadError, "Conflicting http adapter"):
+                self.engine.configure_experiment("sample", "preflight", {
+                    "adapters": {"http": [{"url_contains": "service.test", "body": "one"},
+                                          {"url_contains": "service.test", "body": "two"}]},
+                })
+            self.engine.configure_experiment("sample", "preflight", {"seed": 3, "freeze_time": 10.0,
+                                                                      "uuid": "12345678-1234-5678-1234-567812345678"})
+            frozen = self.engine.callable_experiment("sample", "preflight", "app.preflight_target:now")
+            self.assertEqual(frozen["return_value"], 10.0)
+            self.assertIn("time", {item["input"] for item in frozen["replay"]["controlled"]})
+            self.assertIn("preflight", frozen)
+            self.engine.configure_experiment("sample", "preflight", {
+                "adapters": {"http": [{"url_contains": "service.test", "body": "mock"}]},
+                "patches": [{"target": "urllib.request:urlopen", "code": (
+                    "def replacement(*args, **kwargs):\n"
+                    "    class Response:\n"
+                    "        def read(self):\n"
+                    "            return b'patched'\n"
+                    "    return Response()")}],
+            })
+            downloaded = self.engine.callable_experiment("sample", "preflight", "app.preflight_target:download")
+            self.assertEqual(downloaded["return_value"]["preview"], "patched")
+            self.assertFalse([item for item in downloaded["interactions"] if item.get("adapter") == "http"])
+            self.engine.configure_experiment("sample", "preflight", {"yield_cap": 1_000})
+            comparison = self.engine.compare_experiment("sample", "preflight", "app.preflight_target:large")
+            self.assertFalse(comparison["same_behaviour"])
+            self.assertNotIn("return_value", {item["field"] for item in comparison["differences"]})
+            self.assertIn("return_value", {item["field"] for item in comparison["unknown_comparisons"]})
+            self.engine.configure_experiment("sample", "preflight", {"yield_cap": 10})
+            streamed = self.engine.callable_experiment("sample", "preflight", "app.preflight_target:streamed")
+            self.assertTrue(streamed["collection_truncated"])
+            self.assertEqual(len(streamed["return_value"]), 10)
+            missing = str(Path(self.temp.name) / "missing-python")
+            self.engine.configure_experiment("sample", "preflight", {"interpreter": missing})
+            self.assertFalse(self.engine.experiment_preflight("sample", "preflight")["interpreter"]["available"])
+            with self.assertRaisesRegex(ThreadError, "Could not run callable experiment"):
+                self.engine.callable_experiment("sample", "preflight", "app.preflight_target:now")
+        if os.name != "posix":
+            return
+        from threadtrace.hybrid import run_workspace
+        marker = Path(self.temp.name) / "grandchild-survived.txt"
+        grandchild = f"import pathlib,time; time.sleep(2); pathlib.Path({str(marker)!r}).write_text('alive')"
+        parent = f"import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',{grandchild!r}]); time.sleep(30)"
+        result = run_workspace(Path(self.temp.name), [sys.executable, "-c", parent], timeout=1, output_cap=1_000)
+        self.assertTrue(result["timed_out"])
+        time.sleep(2.5)
+        self.assertFalse(marker.exists())
+
+    def test_hybrid_adapter_replay_denies_unreplaced_operations_and_budgets_exploration(self) -> None:
+        (self.root / "app" / "adapter_guard.py").write_text(
+            "import socket\n"
+            "import sqlite3\n"
+            "import subprocess\n"
+            "import urllib.request\n"
+            "from pathlib import Path\n\n"
+            "def read_selected():\n"
+            "    return Path('selected.txt').read_text()\n\n"
+            "def download():\n"
+            "    return urllib.request.urlopen('https://service.test/item').read().decode()\n\n"
+            "def connect():\n"
+            "    return socket.create_connection(('service.test', 443))\n\n"
+            "def start_process():\n"
+            "    return subprocess.run(['tool'], check=False).returncode\n\n"
+            "def database():\n"
+            "    connection = sqlite3.connect(':memory:')\n"
+            "    connection.execute('SELECT value')\n"
+            "    connection.commit()\n"
+            "    connection.close()\n"
+            "    return 'done'\n\n"
+            "def choose(value: int):\n"
+            "    if value < 0:\n"
+            "        raise ValueError('negative')\n"
+            "    return 'zero' if value == 0 else 'positive'\n\n"
+            "def accept(value):\n"
+            "    return value\n"
+        )
+        with patch("threadtrace.engine.application_directory", return_value=Path(self.temp.name) / "application"):
+            experiment = self.engine.create_experiment("sample", "budgets")
+            (Path(experiment["workspace_path"]) / "selected.txt").write_text("real")
+            self.engine.configure_experiment("sample", "budgets", {
+                "adapters": {
+                    "filesystem": [{"path_contains": "selected.txt", "operation": "read"}],
+                    "network": [{"address_contains": "service.test"}],
+                    "process": [{"command_contains": "tool"}],
+                },
+            })
+            for target in ("app.adapter_guard:read_selected", "app.adapter_guard:connect", "app.adapter_guard:start_process"):
+                denied = self.engine.callable_experiment("sample", "budgets", target)
+                self.assertEqual(denied["exception"]["type"], "PermissionError")
+                entry = next(item for item in denied["interactions"] if item.get("kind") == "adapter")
+                self.assertEqual(entry["status"], "failed")
+                self.assertIn("error", entry)
+                self.assertTrue(entry["adapter_version"])
+            self.engine.configure_experiment("sample", "budgets", {
+                "adapters": {"filesystem": [{"path_contains": "selected.txt", "operation": "read",
+                                              "pass_through": True}]},
+            })
+            passed = self.engine.callable_experiment("sample", "budgets", "app.adapter_guard:read_selected")
+            self.assertEqual(passed["return_value"], "real")
+            self.assertEqual(next(item for item in passed["interactions"] if item.get("kind") == "adapter")["status"],
+                             "pass_through")
+            self.engine.configure_experiment("sample", "budgets", {
+                "adapters": {
+                    "http": [{"url_contains": "service.test", "body": "ok", "latency": 0.01}],
+                    "database": [{"query_contains": "SELECT value", "rows": [[1]]}],
+                },
+            })
+            http_result = self.engine.callable_experiment("sample", "budgets", "app.adapter_guard:download")
+            self.assertEqual(http_result["return_value"], "ok")
+            http_entry = next(item for item in http_result["interactions"] if item.get("adapter") == "http")
+            self.assertEqual(http_entry["status"], "mocked")
+            self.assertGreaterEqual(http_entry["duration_seconds"], 0.01)
+            self.assertTrue(http_entry["adapter_version"])
+            database_result = self.engine.callable_experiment("sample", "budgets", "app.adapter_guard:database")
+            self.assertTrue(any(item["operation"] == "commit" and item["status"] == "completed"
+                                for item in database_result["side_effects"]["external_operations"]))
+            with self.assertRaisesRegex(ThreadError, "cannot pass through and fail"):
+                self.engine.configure_experiment("sample", "budgets", {
+                    "adapters": {"http": [{"url_contains": "service.test", "pass_through": True, "error": "timeout"}]},
+                })
+            with self.assertRaisesRegex(ThreadError, "budgets.max_cases"):
+                self.engine.configure_experiment("sample", "budgets", {"budgets": {"max_cases": 0}})
+            self.engine.configure_experiment("sample", "budgets", {"budgets": {"max_cases": 3}})
+            cases = [{"label": f"case {index}", "args": [index]} for index in range(10)]
+            limited = self.engine.explore_experiment("sample", "budgets", "app.adapter_guard:choose", cases)
+            self.assertEqual(len(limited["results"]), 3)
+            self.assertEqual(limited["budgets"]["requested_cases"], 10)
+            self.assertTrue(limited["budgets"]["cases_truncated"])
+            self.assertEqual(limited["budgets"]["stopped_reason"], "case_limit")
+            retained = self.engine.explore_experiment("sample", "budgets", "app.adapter_guard:choose", [
+                {"label": "failing", "args": [-1]}, {"label": "working", "args": [1]},
+            ])
+            self.assertTrue(any("exception" in item["reasons"] and item["case"]["args"] == [-1]
+                                for item in retained["retained"]))
+            self.assertTrue(any("distinct behaviour" in item["reasons"] for item in retained["retained"]))
+            with self.assertRaisesRegex(ThreadError, "Input generator syntax error"):
+                self.engine.configure_experiment("sample", "budgets", {"input_generators": [{"expression": "("}]})
+            self.engine.configure_experiment("sample", "budgets", {
+                "input_generators": [{"expression": "[{'args': ['first']}, {'args': ['second']}]"}],
+            })
+            generated = self.engine.explore_experiment("sample", "budgets", "app.adapter_guard:accept")
+            generator_case = next(item["case"] for item in generated["results"] if item["case"]["label"] == "generator 1")
+            self.assertEqual(generator_case["execution"], "explicit experiment execution")
+            self.assertGreater(generated["budgets"]["memory_peak_bytes"], 0)
+            self.assertIn("retained", generated)
 
     def test_profiles_and_investigations_are_project_scoped(self) -> None:
         profile = self.engine.save_launch_profile("sample", "check", [sys.executable, "-c", "print('ok')"])
         self.assertEqual(profile["command"][-1], "print('ok')")
         investigation = self.engine.save_investigation("sample", "first look", {"notes": "follow the route"})
-        self.assertEqual(investigation["content"]["notes"], "follow the route")
+        self.assertEqual(investigation["content"]["notes"], [{"text": "follow the route"}])
         self.assertEqual(self.engine.launch_profiles("sample")[0]["name"], "check")
         self.assertEqual(self.engine.investigations("sample")[0]["name"], "first look")
+
+    def test_exports_share_one_version_envelope_across_formats(self) -> None:
+        from threadtrace.exports import report_bundle
+        from threadtrace.formats import EXPORT_FORMAT, EXPORT_SCHEMA_VERSION
+
+        bundle = report_bundle(self.engine, self.queries, "sample")
+        scan = self.engine.latest_scan("sample")
+        self.assertEqual(bundle["format"], EXPORT_FORMAT)
+        self.assertEqual(bundle["export_version"], EXPORT_SCHEMA_VERSION)
+        self.assertEqual(bundle["payload_type"], "report")
+        self.assertEqual(bundle["scan_id"], scan["scan_id"])
+        self.assertTrue(bundle["source"]["files"]["app/main.py"])
+        self.assertTrue(bundle["source"]["digest"])
+        self.assertTrue(bundle["capabilities"])
+        self.assertIn("overview", bundle["payload"])
+        self.assertIn("staleness", bundle["payload"])
+
+        database = str(self.store.path)
+        for output_format in ("json", "markdown", "csv", "html", "mermaid", "dot"):
+            output, errors = StringIO(), StringIO()
+            with redirect_stdout(output), redirect_stderr(errors):
+                code = main(["export", "sample", "--database", database, "--format", output_format])
+            self.assertEqual(code, 0, errors.getvalue())
+            self.assertIn("threadtrace-export", output.getvalue().lower())
+            self.assertNotIn("<script>", output.getvalue())
+        output = StringIO()
+        with redirect_stdout(output), redirect_stderr(StringIO()):
+            main(["export", "sample", "--database", database])
+        self.assertEqual(json.loads(output.getvalue())["payload"]["overview"]["scan_id"], scan["scan_id"])
+
+        destination = Path(self.temp.name) / "bundle.html"
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            code = main(["export", "sample", "--database", database, "--format", "html", "--output", str(destination)])
+        self.assertEqual(code, 0)
+        self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+        self.assertIn("&quot;", destination.read_text())
+
+    def test_investigations_capture_resume_export_and_import_references(self) -> None:
+        from threadtrace.formats import EXPORT_SCHEMA_VERSION
+
+        investigation = self.engine.save_investigation("sample", "route", {
+            "notes": "start at the route",
+            "files": [{"path": "app/api.py"}],
+            "symbols": [{"path": "app/api.py", "line": 6, "qualified_name": "app.api.list_items"}],
+            "hypotheses": [{"text": "limit is unused"}],
+        })
+        content = investigation["content"]
+        self.assertEqual(content["notes"], [{"text": "start at the route"}])
+        self.assertEqual(content["bookmarks"], [])
+        symbol_snapshot = next(item for item in content["source"] if item["line"] == 6)
+        self.assertIn("def list_items", symbol_snapshot["snippet"])
+        self.assertEqual(len(symbol_snapshot["sha256"]), 64)
+
+        resumed = self.engine.resume_investigation("sample", "route")
+        self.assertEqual(resumed["warnings"], [])
+        self.assertEqual({reference["status"] for reference in resumed["references"]}, {"unchanged"})
+
+        export_path = Path(self.temp.name) / "route-investigation.json"
+        exported = self.engine.export_investigation("sample", "route", str(export_path))
+        self.assertEqual(exported["payload_type"], "investigation")
+        self.assertEqual(exported["payload"]["name"], "route")
+        self.assertTrue(exported["source"]["files"]["app/api.py"])
+        self.assertTrue(exported["limitations"])
+        self.assertEqual(stat.S_IMODE(export_path.stat().st_mode), 0o600)
+        self.assertEqual(json.loads(export_path.read_text())["payload"]["content"]["hypotheses"],
+                         [{"text": "limit is unused"}])
+
+        newer = Path(self.temp.name) / "newer-investigation.json"
+        newer.write_text(json.dumps({**json.loads(export_path.read_text()), "export_version": EXPORT_SCHEMA_VERSION + 1}))
+        with self.assertRaisesRegex(ThreadError, "newer"):
+            self.engine.import_investigation("sample", str(newer))
+        with self.assertRaisesRegex(ThreadError, "not a ThreadTrace export"):
+            self.engine.import_investigation("sample", str(self.root / "app" / "main.py"))
+
+        (self.root / "app" / "api.py").write_text("def list_items(limit: int = 10):\n    return limit\n")
+        self.engine.scan("sample")
+        imported = self.engine.import_investigation("sample", str(export_path), "route imported")
+        self.assertEqual(imported["name"], "route imported")
+        self.assertTrue(any("changed since" in warning for warning in imported["warnings"]))
+        kept = [item for item in imported["investigation"]["content"]["source"] if item["line"] == 6]
+        self.assertEqual([item["sha256"] for item in kept], [symbol_snapshot["sha256"]])
+        for section in ("notes", "symbols", "hypotheses"):
+            self.assertEqual(imported["investigation"]["content"][section], content[section])
+
+    def test_investigation_cli_and_read_only_python_api(self) -> None:
+        from threadtrace import HybridHarness, ThreadTrace
+
+        database = str(self.store.path)
+        output, errors = StringIO(), StringIO()
+        with redirect_stdout(output), redirect_stderr(errors):
+            code = main(["investigation", "save", "sample", "cli notes", "--database", database,
+                         "--content", '{"notes": "follow the route"}'])
+        self.assertEqual(code, 0, errors.getvalue())
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            self.assertEqual(main(["investigation", "resume", "sample", "cli notes", "--database", database]), 0)
+        path = Path(self.temp.name) / "cli-investigation.json"
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            self.assertEqual(main(["investigation", "export", "sample", "cli notes", "--database", database,
+                                   "--output", str(path)]), 0)
+        output = StringIO()
+        with redirect_stdout(output), redirect_stderr(StringIO()):
+            self.assertEqual(main(["investigation", "import", "sample", str(path), "--name", "imported notes",
+                                   "--database", database, "--format", "json"]), 0)
+        self.assertEqual(json.loads(output.getvalue())["name"], "imported notes")
+
+        with ThreadTrace(self.store.path) as api:
+            self.assertEqual(api.project("sample")["name"], "sample")
+            self.assertTrue(api.scans("sample"))
+            self.assertEqual(api.latest_scan("sample")["scan_id"], self.engine.latest_scan("sample")["scan_id"])
+            self.assertTrue(api.query("functions", "sample"))
+            self.assertEqual(api.investigation("sample", "cli notes")["name"], "cli notes")
+            self.assertEqual(api.export("sample")["payload_type"], "report")
+            with self.assertRaisesRegex(ThreadError, "not a read-only query"):
+                api.query("scan", "sample")
+            self.assertFalse(hasattr(api, "run_experiment"))
+        self.assertEqual(HybridHarness.__name__, "HybridHarness")
 
     def test_saved_profile_executes_interpreter_environment_and_working_directory(self) -> None:
         environment_dir = Path(self.temp.name) / "runtime env with spaces"
@@ -720,8 +1047,8 @@ class EngineTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(output.getvalue())["summary"]["renamed"], 1)
-        self.assertEqual(exported["workspace_changes"]["summary"]["renamed"], 1)
-        self.assertEqual(len(exported["patches"]), 1)
+        self.assertEqual(exported["payload"]["workspace_changes"]["summary"]["renamed"], 1)
+        self.assertEqual(len(exported["payload"]["patches"]), 1)
         by_kind = {change["kind"]: change for change in report["changes"]}
         self.assertEqual(
             {"modified", "created", "deleted", "renamed", "binary"}.issubset(by_kind),
@@ -1209,7 +1536,9 @@ class EngineTests(unittest.TestCase):
             if len(path) > 1:
                 setattr(args, f"{path[0]}_command", path[1])
             allowed = STANDARD_FORMATS | {"mermaid", "dot"} if path[0] in unrestricted else STANDARD_FORMATS
-            if path == ("experiment", "diff"):
+            if path[0] == "export":
+                allowed = {"json", "markdown", "csv", "html", "mermaid", "dot"}
+            elif path == ("experiment", "diff"):
                 allowed = {"text", "json"}
             elif path[0] in text_only:
                 allowed = {"text"}
@@ -1613,7 +1942,7 @@ class EngineTests(unittest.TestCase):
         report = self.queries.trace_resources("sample", result["trace_id"])
         self.assertEqual(
             set(report["by_resource"]),
-            {"database", "filesystem", "http", "serialization"},
+            {"database", "filesystem", "http", "network", "serialization"},
         )
         self.assertGreaterEqual(report["failure_count"], 1)
         self.assertNotIn("top-secret", json.dumps(report))
@@ -1701,6 +2030,72 @@ class EngineTests(unittest.TestCase):
         for statuses in by_correlation.values():
             if "failed" in statuses:
                 self.assertNotIn("completed", statuses)
+
+    def test_runtime_tcp_ftp_savepoints_status_and_static_preflight(self) -> None:
+        (self.root / "network_ftp_runner.py").write_text(
+            "import ftplib\n"
+            "import socket\n"
+            "import sqlite3\n"
+            "import threading\n\n"
+            "server = socket.socket()\n"
+            "server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+            "server.bind(('127.0.0.1', 0))\n"
+            "server.listen(1)\n"
+            "port = server.getsockname()[1]\n"
+            "def serve():\n"
+            "    connection, _ = server.accept()\n"
+            "    connection.sendall(b'220 fixture ready\\r\\n')\n"
+            "    with connection.makefile('rwb') as stream:\n"
+            "        for line in stream:\n"
+            "            command = line.split(b' ', 1)[0].upper()\n"
+            "            if command == b'USER':\n"
+            "                connection.sendall(b'331 password\\r\\n')\n"
+            "            elif command == b'PASS':\n"
+            "                connection.sendall(b'230 ok\\r\\n')\n"
+            "            elif command == b'QUIT':\n"
+            "                connection.sendall(b'221 bye\\r\\n')\n"
+            "                break\n"
+            "            else:\n"
+            "                connection.sendall(b'200 ok\\r\\n')\n"
+            "    connection.close()\n"
+            "threading.Thread(target=serve, daemon=True).start()\n"
+            "client = ftplib.FTP()\n"
+            "client.connect('127.0.0.1', port, timeout=3)\n"
+            "client.login('fixture', 'password')\n"
+            "client.quit()\n"
+            "server.close()\n"
+            "database = sqlite3.connect(':memory:')\n"
+            "database.execute('create table values_table (value text)')\n"
+            "database.execute('savepoint outer')\n"
+            "database.execute(\"insert into values_table values ('one')\")\n"
+            "database.execute('release outer')\n"
+            "cursor = database.execute('select value from values_table')\n"
+            "assert cursor.fetchone() == ('one',)\n"
+            "assert cursor.fetchone() is None\n"
+            "database.rollback()\n"
+        )
+        result = self.engine.trace(
+            "sample", [sys.executable, "network_ftp_runner.py"], timeout=8, output_cap=10_000,
+        )
+        self.assertEqual(result["exit_code"], 0, result["stderr"])
+        self.assertEqual(result["preflight"]["status"], "static-estimate")
+        self.assertFalse(result["preflight"]["guarantee"])
+        report = self.queries.trace_resources("sample", result["trace_id"])
+        timeline = [event["evidence"]["details"] for event in report["timeline"]]
+        network = {((event.get("details") or {}).get("protocol"), event.get("operation")) for event in timeline
+                   if event.get("resource_kind") == "network"}
+        self.assertIn(("ftp", "connect"), network)
+        self.assertIn(("ftp", "login"), network)
+        self.assertIn(("ftp", "quit"), network)
+        self.assertIn(("tcp", "connect"), network)
+        database = {event.get("operation") for event in timeline
+                    if event.get("resource_kind") == "database"}
+        self.assertTrue({"savepoint", "release", "fetchone"}.issubset(database))
+        self.assertTrue(any(item["adapter"] == "sqlite3" and item["status"] == "supported"
+                            for item in report["adapter_support"]))
+        self.assertIn("sqlite3", report["adapter_performance"])
+        self.assertTrue(all("tls_intercepted" not in event or not event["tls_intercepted"]
+                            for event in timeline if event.get("resource_kind") == "network"))
 
     def test_runtime_redacts_every_documented_credential_location_and_marks_truncation(self) -> None:
         secrets = {
@@ -2260,21 +2655,20 @@ class EngineTests(unittest.TestCase):
             session.add_breakpoint(runner, 2, kind="tracepoint")
             session.add_breakpoint(runner, 4, condition="value == 3")
             session.continue_run()
-            for _ in range(100):
-                session.poll()
-                if any(event.get("kind") == "tracepoint" for event in session.events) and any(
-                    event.get("line") == 4 and event.get("name") == "loop" for event in session.events
-                ) and not session.finished:
-                    break
-                time.sleep(0.02)
-            self.assertTrue(any(event.get("kind") == "tracepoint" for event in session.events))
-            self.assertFalse(session.finished)
-            session.continue_run()
-            for _ in range(100):
+            observed_line_four = False
+            for _ in range(250):
                 session.poll()
                 if session.finished:
                     break
+                if any(event.get("kind") == "tracepoint" for event in session.events):
+                    observed_line_four = observed_line_four or any(
+                        event.get("line") == 4 and event.get("name") == "loop" for event in session.events
+                    )
+                    # The conditional breakpoint may be holding the worker until the
+                    # next command arrives, so keep the command channel drained.
+                    session.continue_run()
                 time.sleep(0.02)
+            self.assertTrue(observed_line_four)
             self.assertTrue(session.finished)
             self.assertEqual(session.result()["stdout"].strip(), "5")
 
@@ -2803,7 +3197,7 @@ class EngineTests(unittest.TestCase):
                         self.assertIn("Source context", app.inspector.text)
                         self.assertNotIn('"created":', app.inspector.text)
                         app._select_event(changed)
-                        self.assertIn("Changed\n  value = 2 (int)", app.inspector.text)
+                        self.assertIn("Rebound\n  value = 2 (int)", app.inspector.text)
                         self.assertEqual(app._variables_at(app.events[changed])["value"]["value"], 2)
                         app._select_event(removed)
                         self.assertIn("Removed\n  value", app.inspector.text)
@@ -2812,6 +3206,12 @@ class EngineTests(unittest.TestCase):
                         await asyncio.sleep(0.1)
                         self.assertEqual(app.selected, removed - 1)
                         self.assertFalse(app.following)
+                        # Drain pending valid events so the next tick adds exactly one.
+                        for _ in range(20):
+                            settled = len(app.events)
+                            app._tick()
+                            if len(app.events) == settled:
+                                break
                         extra = dict(app.events[changed])
                         extra["variables"] = {"created": {"password": {"type": "str", "value": "<redacted>"}}, "changed": {}, "removed": []}
                         count = len(app.events)
@@ -3469,6 +3869,477 @@ class EngineTests(unittest.TestCase):
         self.assertLess(len(body), 200)
         self.assertEqual(json.loads(body)["error"], "Could not build local analysis response.")
         self.assertNotIn(b"private failure detail", body)
+
+    def test_browser_graph_families_paginate_filter_and_export_mermaid(self) -> None:
+        from threadtrace.browser import graph_mermaid, graph_payload
+
+        targets = {
+            "dependency": "app.core",
+            "call": "app.core.Service.process",
+            "class": "app.core.Service",
+            "ast": "app.core",
+            "dataflow": "app.core.Service.process",
+            "control-flow": "app.core.Service.process",
+            "execution-flow": "main",
+        }
+        for family, target in targets.items():
+            with self.subTest(family=family):
+                payload = graph_payload(self.queries, "sample", family=family, target=target, limit=5)
+                self.assertEqual(payload["family"], family)
+                self.assertTrue(payload["nodes"])
+                identifiers = {node["id"] for node in payload["nodes"]}
+                for edge in payload["edges"]:
+                    self.assertIn(edge["source"], identifiers)
+                    self.assertIn(edge["target"], identifiers)
+                    self.assertIn(edge["evidence_class"],
+                                  {"statically resolved", "heuristically predicted", "observed at runtime", "unknown"})
+                self.assertEqual(payload["capability"]["status"], "Partial")
+                self.assertIn("stale", payload)
+                self.assertEqual(payload["page"]["invalid_edges"], 0)
+                mermaid = graph_mermaid(payload)
+                self.assertIn("flowchart LR", mermaid)
+                if payload["edges"]:
+                    self.assertIn("-->", mermaid)
+
+        page = graph_payload(self.queries, "sample", family="dependency", limit=1)
+        self.assertGreater(page["page"]["edge_total"], 1)
+        self.assertEqual(page["page"]["returned_edges"], 1)
+        self.assertEqual(page["page"]["next_offset"], 1)
+        self.assertTrue(page["page"]["truncated"])
+        filtered = graph_payload(self.queries, "sample", family="dependency", target="app.core",
+                                 kinds={"import"}, evidence={"statically resolved"}, q="helpers")
+        self.assertTrue(filtered["edges"])
+        self.assertTrue(all(edge["kind"] == "import" for edge in filtered["edges"]))
+        self.assertTrue(all("helpers" in edge["source"] + edge["target"] for edge in filtered["edges"]))
+
+    def test_browser_mermaid_escapes_labels_and_drops_unknown_edges(self) -> None:
+        from threadtrace.browser import graph_mermaid
+
+        value = {
+            "nodes": [{"id": "a", "label": 'evil "name"\n<tag>|pipe'}],
+            "edges": [{"source": "a", "target": "missing", "kind": 'call"|evil', "label": "bad"}],
+        }
+        mermaid = graph_mermaid(value)
+        self.assertIn("flowchart LR", mermaid)
+        self.assertIn("#quot;", mermaid)
+        self.assertIn("#lt;", mermaid)
+        self.assertIn("#124;", mermaid)
+        self.assertNotIn('evil "name"', mermaid)
+        self.assertNotIn("missing", mermaid)
+        self.assertIn("Dropped 1 edge", mermaid)
+
+    def test_loopback_browser_serves_graph_source_search_and_read_only_controls(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+        from urllib.error import HTTPError
+        from urllib.request import Request, urlopen
+
+        from threadtrace.browser import BrowserServer
+
+        try:
+            server = BrowserServer("127.0.0.1", 0, self.queries, "sample")
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EPERM, errno.EADDRNOTAVAIL}:
+                self.skipTest("Loopback sockets are prohibited by this environment")
+            raise
+
+        (Path(self.temp.name) / "outside.py").write_text("secret = 1\n")
+
+        def fetch(path: str, method: str = "GET", headers: dict[str, str] | None = None) -> tuple[int, Any, bytes]:
+            request = Request(server.url.rstrip("/") + path, method=method,
+                              data=b"{}" if method != "GET" else None, headers=headers or {})
+            try:
+                with urlopen(request, timeout=2) as response:
+                    return response.status, response.headers, response.read()
+            except HTTPError as exc:
+                try:
+                    return exc.code, exc.headers, exc.read()
+                finally:
+                    exc.close()
+
+        def call(path: str, method: str = "GET", headers: dict[str, str] | None = None) -> tuple[int, Any, bytes]:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(fetch, path, method, headers)
+                server.handle_request()
+                return future.result(timeout=2)
+
+        server.timeout = 2
+        try:
+            page = call("/")
+            graph = call("/api/graph?family=dependency&target=app.core&limit=1")
+            mermaid = call("/api/graph.mmd?family=dependency&target=app.core")
+            source = call("/api/source?path=app/core.py&line=4&context=2")
+            traversal = call("/api/source?path=../outside.py")
+            search = call("/api/search?q=format_name")
+            unknown = call("/api/graph?family=missing&target=app.core")
+            posted = call("/api/graph", method="POST")
+            wrong_host = call("/api/graph?family=ast", headers={"Host": "evil.example"})
+            wrong_origin = call("/api/graph?family=ast", headers={"Origin": "http://evil.example"})
+        finally:
+            server.server_close()
+
+        self.assertEqual(page[0], 200)
+        self.assertEqual(page[1].get_content_type(), "text/html")
+        self.assertIn(b'id="graph"', page[2])
+        self.assertIn(b"graph.mmd", page[2])
+        self.assertIn(b"Control-flow graph", page[2])
+
+        self.assertEqual(graph[0], 200)
+        payload = json.loads(graph[2])
+        self.assertEqual(payload["page"]["limit"], 1)
+        self.assertLessEqual(payload["page"]["returned_edges"], 1)
+        self.assertTrue(payload["nodes"])
+
+        self.assertEqual(mermaid[0], 200)
+        self.assertEqual(mermaid[1].get_content_type(), "text/plain")
+        self.assertIn(b"flowchart LR", mermaid[2])
+
+        self.assertEqual(source[0], 200)
+        snippet = json.loads(source[2])
+        self.assertEqual(snippet["path"], "app/core.py")
+        self.assertIn("class Service", "\n".join(line["text"] for line in snippet["lines"]))
+        self.assertNotIn(str(self.root), source[2].decode())
+
+        self.assertEqual(traversal[0], 400)
+        self.assertIn("registered project", json.loads(traversal[2])["error"])
+        self.assertNotIn(b"secret = 1", traversal[2])
+
+        self.assertEqual(search[0], 200)
+        results = json.loads(search[2])["results"]
+        self.assertTrue(any(item["target"] == "app.helpers.format_name" and item["family"] == "call"
+                            for item in results))
+
+        self.assertEqual(unknown[0], 400)
+        self.assertIn("Unknown graph family", json.loads(unknown[2])["error"])
+        self.assertEqual(posted[0], 405)
+        self.assertEqual(posted[1]["Allow"], "GET")
+        self.assertEqual(json.loads(posted[2])["error"], "This local browser view is read-only.")
+        self.assertEqual(wrong_host[0], 403)
+        self.assertEqual(wrong_origin[0], 403)
+
+    def test_tui_keybindings_modes_and_compact_threshold(self) -> None:
+        from prompt_toolkit.application import create_app_session
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from threadtrace.tui import ASCII_GLYPHS, COMMANDS, DEFAULT_KEYS, ThreadApp, compact_required, resolve_keys
+
+        from threadtrace.config import load
+
+        self.assertEqual(resolve_keys([]), DEFAULT_KEYS)
+        self.assertEqual(resolve_keys(["overview=n"])["overview"], "n")
+        with self.assertRaisesRegex(ValueError, "Unknown TUI keybinding"):
+            resolve_keys(["missing=x"])
+        with self.assertRaisesRegex(ValueError, "assigned to both"):
+            resolve_keys(["overview=m"])
+        with self.assertRaisesRegex(ValueError, "reserved"):
+            resolve_keys(["overview=t"])
+        with self.assertRaises(ValueError):
+            resolve_keys(["overview="])
+        self.assertFalse(compact_required(80, 20))
+        self.assertTrue(compact_required(79, 40))
+        self.assertTrue(compact_required(120, 19))
+        self.assertTrue(compact_required(120, 40, True))
+
+        path = Path(self.temp.name) / "keys.yaml"
+        path.write_text("tui:\n  keybindings: [overview=n, quit=z]\n")
+        self.assertEqual(load(path)["tui"]["keybindings"], ["overview=n", "quit=z"])
+        path.write_text("tui:\n  keybindings: [overview=n, modules=n]\n")
+        with self.assertRaisesRegex(ValueError, "more than once"):
+            load(path)
+        path.write_text("tui:\n  keybindings: [overview=n, overview=m]\n")
+        with self.assertRaisesRegex(ValueError, "repeats action"):
+            load(path)
+
+        with create_pipe_input() as pipe, create_app_session(input=pipe, output=DummyOutput()):
+            app = ThreadApp(self.engine, self.queries, "sample", {"compact": True, "ascii": True, "colour": False})
+            self.assertTrue(app.compact)
+            self.assertEqual(app.glyphs, ASCII_GLYPHS)
+            app._load_view("functions")
+            rendered = "".join(text for _, text in app._results_text())
+            self.assertTrue(rendered.startswith("> "))
+            self.assertNotIn("▶", rendered)
+            app._set_compact_pane("inspector")
+            self.assertEqual(app.compact_pane, "inspector")
+            self.assertEqual(app.results_frame.title, "Inspector")
+            self.assertEqual(app.app.layout.current_control, app.inspector.control)
+            app._set_compact_pane("results")
+            self.assertEqual(app.app.layout.current_control, app.results)
+            app._load_view("functions")
+            app.selected = next(index for index, row in enumerate(app.rows) if row["qualified_name"] == "app.helpers.format_name")
+            app._go_to_definition()
+            self.assertEqual(app.current_view, "definitions")
+            self.assertTrue(app.rows)
+            app._open_references()
+            self.assertEqual(app.current_view, "references")
+            self.assertTrue(any(row["relative_path"] == "app/main.py" for row in app.rows))
+            from prompt_toolkit.document import Document
+            from threadtrace.tui import PythonLexer
+            fragments = PythonLexer().lex_document(Document("def f():\n    # note\n    return 1\n"))(2)
+            self.assertIn(("class:token.keyword", "return"), fragments)
+            self.assertIn(("class:token.comment", "# note"), PythonLexer().lex_document(Document("# note"))(0))
+            source = self.root / "app" / "helpers.py"
+            app._open_fullscreen("value = 1\n", "Code", source, 1, full_source="value = 1\n")
+            app._toggle_edit_mode()
+            app.source_editor.text = "value = 2\n"
+            app._close_fullscreen()
+            self.assertTrue(app.source_mode)
+            self.assertEqual(app.status_level, "warning")
+            app.source_editor.text = app.source_original
+            app._close_fullscreen()
+            self.assertFalse(app.source_mode)
+            app.rows, app.current_view, app.selected = app._command_entries(""), "commands", 0
+            self.assertEqual({row["name"] for row in app.rows}, set(COMMANDS))
+            self.assertIn(":overview", "".join(text for _, text in app._results_text()))
+            app._run_command("ascii")
+            self.assertFalse(app.ascii)
+            app._run_command("colour")
+            self.assertTrue(app.colour)
+            app._run_command("compact")
+            self.assertFalse(app.compact)
+            app.compact_preference = False
+            with patch("threadtrace.tui._terminal_size", return_value=(60, 15)):
+                app._sync_terminal_size()
+            self.assertTrue(app.compact)
+            with patch("threadtrace.tui._terminal_size", return_value=(120, 40)):
+                app._sync_terminal_size()
+            self.assertFalse(app.compact)
+            self.assertEqual(app.status_level, "info")
+            app._run_command("missing")
+            self.assertEqual(app.status_level, "error")
+
+    def test_tui_source_editing_checks_syntax_diff_and_hash(self) -> None:
+        from prompt_toolkit.application import create_app_session
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from threadtrace.tui import ThreadApp
+
+        source = self.root / "app" / "helpers.py"
+        original = source.read_text(encoding="utf-8")
+        edited = original.replace("value.strip()", "value.strip().lower()")
+        with create_pipe_input() as pipe, create_app_session(input=pipe, output=DummyOutput()):
+            app = ThreadApp(self.engine, self.queries, "sample", {"compact": True})
+            app._open_fullscreen(original, "Code", source, 1, full_source=original)
+            app._toggle_edit_mode()
+            self.assertTrue(app.edit_mode)
+            app.source_editor.text = "def broken(:\n"
+            app._save_source(rescan=False)
+            self.assertFalse(app.confirm_mode)
+            self.assertIn("syntax", app.status.lower())
+            self.assertEqual(source.read_text(encoding="utf-8"), original)
+            app.source_editor.text = edited
+            app._save_source(rescan=False)
+            self.assertTrue(app.confirm_mode)
+            self.assertIn("+    return value.strip().lower()", app.save_diff)
+            self.assertEqual(source.read_text(encoding="utf-8"), original)
+            app._cancel_save()
+            self.assertFalse(app.confirm_mode)
+            self.assertEqual(source.read_text(encoding="utf-8"), original)
+            app.source_editor.text = edited
+            app._save_source(rescan=False)
+            app._confirm_save()
+            self.assertFalse(app.confirm_mode)
+            self.assertEqual(source.read_text(encoding="utf-8"), edited)
+            self.assertFalse(list(source.parent.glob(".threadtrace-*.tmp")))
+            app._toggle_edit_mode()
+            app.source_editor.text = edited + "\n# pending\n"
+            source.write_text(edited + "\n# other writer\n", encoding="utf-8")
+            app._save_source(rescan=False)
+            self.assertIn("changed outside", app.status)
+            self.assertEqual(source.read_text(encoding="utf-8"), edited + "\n# other writer\n")
+
+    def test_tui_rescan_preserves_view_and_selected_row(self) -> None:
+        from prompt_toolkit.application import create_app_session
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from threadtrace.tui import ThreadApp
+
+        with create_pipe_input() as pipe, create_app_session(input=pipe, output=DummyOutput()):
+            app = ThreadApp(self.engine, self.queries, "sample", {"compact": True})
+            app._load_view("functions")
+            app.selected = min(2, len(app.rows) - 1)
+            identity = app._row_identity(app.rows[app.selected])
+            self.assertTrue(app._rescan())
+            self.assertEqual(app.current_view, "functions")
+            self.assertEqual(app._row_identity(app.rows[app.selected]), identity)
+            self.assertEqual(app.status_level, "good")
+            app._open_graph("file")
+            node = app.rows[app.selected]["id"]
+            self.assertTrue(app._rescan())
+            self.assertEqual(app.graph_data["kind"], "file")
+            self.assertEqual(app.rows[app.selected]["id"], node)
+
+    @staticmethod
+    def _fake_http(payload: dict[str, Any]) -> Any:
+        class FakeResponse:
+            def read(self) -> bytes:
+                return json.dumps(payload).encode("utf-8")
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *exc: Any) -> bool:
+                return False
+
+        return FakeResponse()
+
+    def test_ai_provider_redaction_approval_and_validation(self) -> None:
+        from threadtrace import ai
+
+        facts = {
+            "target": {"qualified_name": "app.helpers.format_name", "relative_path": "app/helpers.py",
+                       "line_start": 1, "purpose": "Format a name.", "password": "hunter2"},
+            "configuration": {"note": "api_key=abc123"},
+            "project_overview": {"purpose": "Sample", "components": []},
+        }
+        structured = {
+            "summary": "Formats names.",
+            "claims": [
+                {"text": "It strips whitespace.", "evidence": "app/helpers.py:1"},
+                {"text": "Runtime latency is unknown.", "evidence": "unknown"},
+            ],
+            "mermaid": 'graph TD\nA["app.helpers.format_name"]\nA --> A',
+        }
+        local = ai.settings_from({"provider": "ollama", "model": "test", "temperature": 0.1, "token_limit": 200})
+        sent: dict[str, Any] = {}
+
+        def fake_urlopen(request: Any, timeout: int) -> Any:
+            sent.update(url=request.full_url, body=json.loads(request.data), timeout=timeout)
+            return self._fake_http({"message": {"content": json.dumps(structured)}})
+
+        with patch("threadtrace.ai.urlopen", side_effect=fake_urlopen):
+            result = ai.explain(facts, local)
+        self.assertEqual(sent["url"], "http://127.0.0.1:11434/api/chat")
+        self.assertEqual(sent["body"]["model"], "test")
+        self.assertEqual(sent["body"]["options"]["num_predict"], 200)
+        self.assertNotIn("hunter2", json.dumps(sent["body"]))
+        self.assertNotIn("abc123", json.dumps(sent["body"]))
+        self.assertGreater(result["request"]["manifest"]["redactions"], 0)
+        self.assertEqual(result["response"]["claims"][0]["evidence"], "app/helpers.py:1")
+        self.assertIn("app/helpers.py:1", result["narrative"])
+
+        remote = ai.settings_from({
+            "provider": "openai", "endpoint": "http://10.0.0.5:9000/v1/chat/completions",
+        })
+        with self.assertRaisesRegex(ai.AIError, "requires fresh approval"):
+            ai.explain(facts, remote)
+        approved: dict[str, Any] = {}
+
+        def approve(request: dict[str, Any]) -> bool:
+            approved.update(request)
+            return True
+
+        with patch.dict(os.environ, {"THREADTRACE_AI_API_KEY": "top-secret-key"}), \
+                patch("threadtrace.ai.urlopen", return_value=self._fake_http(
+                    {"choices": [{"message": {"content": json.dumps(structured)}}]})) as mocked:
+            result = ai.explain(facts, remote, approve)
+        sent_request = mocked.call_args.args[0]
+        self.assertEqual(sent_request.headers.get("Authorization"), "Bearer top-secret-key")
+        self.assertNotIn("top-secret-key", sent_request.data.decode("utf-8"))
+        self.assertEqual(approved["digest"], result["request"]["digest"])
+        self.assertTrue(result["request"]["remote"])
+
+        invented = dict(structured, claims=[{"text": "Imaginary", "evidence": "app/ghost.py:7"}])
+        with patch("threadtrace.ai.urlopen", return_value=self._fake_http({"message": {"content": json.dumps(invented)}})):
+            with self.assertRaisesRegex(ai.AIError, "not present"):
+                ai.explain(facts, local)
+        bad_diagram = dict(structured, mermaid='graph TD\nA["app.ghost.symbol"]\nA --> A')
+        with patch("threadtrace.ai.urlopen", return_value=self._fake_http({"message": {"content": json.dumps(bad_diagram)}})):
+            with self.assertRaisesRegex(ai.AIError, "not present"):
+                ai.explain(facts, local)
+        with patch("threadtrace.ai.urlopen", return_value=self._fake_http({"message": {"content": "not json"}})):
+            with self.assertRaisesRegex(ai.AIError, "invalid JSON"):
+                ai.explain(facts, local)
+
+        template = Path(self.temp.name) / "prompt.txt"
+        template.write_text("CUSTOM {facts}")
+        with patch("threadtrace.ai.urlopen", side_effect=fake_urlopen):
+            ai.explain(facts, ai.settings_from({"provider": "ollama", "template_path": str(template)}))
+        self.assertTrue(sent["body"]["messages"][1]["content"].startswith("CUSTOM {"))
+        template.write_text("no placeholder")
+        with self.assertRaisesRegex(ai.AIError, "placeholder"):
+            ai.explain(facts, ai.settings_from({"provider": "ollama", "template_path": str(template)}))
+
+        with self.assertRaisesRegex(ai.AIError, "Unsupported ollama parameter"):
+            ai.settings_from({"provider": "ollama", "parameters": ["bogus=1"]})
+        with self.assertRaisesRegex(ai.AIError, "credentials"):
+            ai.settings_from({"provider": "openai", "endpoint": "https://user:pass@example.com/v1"})
+        with self.assertRaisesRegex(ai.AIError, "temperature"):
+            ai.settings_from({"provider": "ollama", "temperature": 3})
+
+    def test_ai_exchange_is_persisted_listed_and_deletable(self) -> None:
+        content = json.dumps({"summary": "Format names.", "claims": [
+            {"text": "Strips whitespace.", "evidence": "app/helpers.py:1"}], "mermaid": None})
+        with patch("threadtrace.ai.urlopen", return_value=self._fake_http({"message": {"content": content}})):
+            result = self.queries.ai_explain("sample", "app.helpers.format_name",
+                                             {"provider": "ollama", "model": "fake"})
+        self.assertEqual(result["provider"], "ollama")
+        self.assertEqual(result["model"], "fake")
+        self.assertIn("Format names.", result["narrative"])
+        self.assertTrue(result["report_kind"].startswith("ai_explain:"))
+        self.assertIn("redactions", result["request"]["manifest"])
+        history = self.queries.ai_history("sample")
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["target"], "app.helpers.format_name")
+        self.assertEqual(history[0]["claims"], 1)
+        self.assertIn("delete report", history[0]["delete_with"])
+        self.engine.remove_report("sample", history[0]["report_kind"])
+        self.assertEqual(self.queries.ai_history("sample"), [])
+
+    def test_ai_cli_requires_digest_for_remote_and_shows_payload(self) -> None:
+        content = json.dumps({"summary": "Format names.", "claims": [], "mermaid": None})
+        base = ["explain", "sample", "app.helpers.format_name", "--ai", "--ai-provider", "openai",
+                "--ai-endpoint", "http://10.0.0.5:9000/v1/chat/completions", "--database", str(self.store.path)]
+        errors = StringIO()
+        with redirect_stdout(StringIO()), redirect_stderr(errors), \
+                patch.dict(os.environ, {"THREADTRACE_AI_API_KEY": "secret-value"}):
+            self.assertEqual(main(base + ["--ai-show"]), 0)
+        preview = json.loads(errors.getvalue())
+        digest = preview["digest"]
+        self.assertTrue(preview["remote"])
+        self.assertIn("app.helpers.format_name", json.dumps(preview["payload"]))
+        self.assertNotIn("secret-value", json.dumps(preview))
+
+        with redirect_stdout(StringIO()), redirect_stderr(errors := StringIO()), \
+                patch.dict(os.environ, {"THREADTRACE_AI_API_KEY": "secret-value"}):
+            self.assertEqual(main(base), 2)
+        self.assertIn(digest, errors.getvalue())
+        self.assertIn("--ai-approve", errors.getvalue())
+
+        output = StringIO()
+        with redirect_stdout(output), redirect_stderr(StringIO()), patch.dict(os.environ, {"THREADTRACE_AI_API_KEY": "secret-value"}), \
+                patch("threadtrace.ai.urlopen", return_value=self._fake_http(
+                    {"choices": [{"message": {"content": content}}]})):
+            self.assertEqual(main(base + ["--ai-approve", digest]), 0)
+        self.assertIn("Format names.", output.getvalue())
+        self.assertEqual(len(self.queries.ai_history("sample")), 1)
+
+    def test_ai_configuration_validates_provider_settings(self) -> None:
+        from threadtrace.ai import AIError, settings_from
+        from threadtrace.config import load
+
+        path = Path(self.temp.name) / "ai.yaml"
+        path.write_text(
+            "ai:\n  provider: openai\n  model: local-model\n  temperature: 0.5\n"
+            "  generation_limit: 128\n  timeout_seconds: 5\n  key_env: MY_AI_KEY\n"
+            "  parameters: [top_p=0.9, seed=7]\n"
+        )
+        configuration = load(path)
+        self.assertEqual(configuration["ai"]["temperature"], 0.5)
+        self.assertEqual(configuration["ai"]["generation_limit"], 128)
+        settings = settings_from(configuration["ai"])
+        self.assertEqual(settings.provider, "openai")
+        self.assertEqual(settings.parameters, {"top_p": 0.9, "seed": 7})
+        self.assertFalse(settings.remote)
+        path.write_text("ai:\n  provider: unknown\n")
+        with self.assertRaisesRegex(ValueError, "provider"):
+            load(path)
+        path.write_text("ai:\n  temperature: 3\n")
+        with self.assertRaisesRegex(ValueError, "temperature"):
+            load(path)
+        path.write_text("ai:\n  parameters: [top_p=0.9, top_p=0.5]\n")
+        with self.assertRaisesRegex(ValueError, "repeats parameter"):
+            load(path)
+        with self.assertRaisesRegex(AIError, "Unsupported openai parameter"):
+            settings_from({"provider": "openai", "parameters": ["num_ctx=1"]})
 
     def test_ai_prompt_is_bounded_and_evidence_only(self) -> None:
         from threadtrace.ai import _prompt

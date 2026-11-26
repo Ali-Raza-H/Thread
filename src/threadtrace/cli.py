@@ -16,12 +16,41 @@ from typing import Any, Callable
 from . import __version__
 from .config import configuration_path, load as load_config, merge as merge_config, write_default as write_default_config
 from .engine import Engine, ThreadError
+from .exports import header_lines, report_bundle, write_text
 from .query import QueryService
 from .store import Store
 
 
 def _json_default(value: Any) -> str:
     return str(value)
+
+
+def _ai_options(configuration: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    """Merge configured AI settings with explicit command-line overrides."""
+    options = dict(configuration["ai"])
+    overrides = {
+        "provider": args.ai_provider, "model": args.ai_model, "endpoint": args.ai_endpoint,
+        "temperature": args.ai_temperature, "generation_limit": args.ai_tokens,
+        "template_path": args.ai_template,
+    }
+    options.update({key: value for key, value in overrides.items() if value is not None})
+    options["parameters"] = list(configuration["ai"].get("parameters") or []) + list(args.ai_parameter or [])
+    return options
+
+
+def _ai_approval(args: argparse.Namespace) -> Callable[[dict[str, Any]], bool]:
+    """Approve exactly one remote payload by digest, or interactively after review."""
+    def approve(request: dict[str, Any]) -> bool:
+        if args.ai_approve and args.ai_approve == request["digest"]:
+            print(json.dumps(request["payload"], indent=2, default=_json_default), file=sys.stderr)
+            return True
+        if not sys.stdin.isatty():
+            return False
+        print(json.dumps(request["payload"], indent=2, default=_json_default), file=sys.stderr)
+        print(f"Send exactly this payload to {request['manifest']['endpoint']}? Type 'approve': ",
+              end="", file=sys.stderr, flush=True)
+        return sys.stdin.readline().strip().lower() == "approve"
+    return approve
 
 
 def render(value: Any, output_format: str) -> None:
@@ -248,6 +277,24 @@ def _graph_export(value: dict[str, Any], output_format: str) -> str:
     return "\n".join(lines)
 
 
+def _render_export(bundle: dict[str, Any], output_format: str) -> str:
+    """Render one bundle so every supported format carries the same metadata."""
+    if output_format == "json":
+        return json.dumps(bundle, indent=2, sort_keys=True, default=_json_default)
+    if output_format == "markdown":
+        return _markdown(bundle, "ThreadTrace export")
+    if output_format == "html":
+        return _html(bundle, "ThreadTrace export")
+    if output_format in {"mermaid", "dot"}:
+        prefix = "%%" if output_format == "mermaid" else "//"
+        return "\n".join([*header_lines(bundle, prefix), "", _graph_export(bundle["payload"]["architecture"], output_format)])
+    records = []
+    for section, value in bundle["payload"].items():
+        for row in value if isinstance(value, list) else [value]:
+            records.append({"section": section, **(row if isinstance(row, dict) else {"value": row})})
+    return "\n".join([*header_lines(bundle, "#"), _csv(records)])
+
+
 def _short(value: Any, limit: int = 180) -> str:
     if isinstance(value, (dict, list)):
         text = json.dumps(value)
@@ -260,6 +307,7 @@ ALL_FORMATS = ("text", "json", "markdown", "csv", "html", "mermaid", "dot")
 STANDARD_FORMATS = {"text", "json", "markdown", "csv", "html"}
 _COMMAND_FORMATS: dict[tuple[str, str | None] | str, set[str]] = {
     "architecture": STANDARD_FORMATS | {"mermaid", "dot"},
+    "export": {"json", "markdown", "csv", "html", "mermaid", "dot"},
     ("experiment", "diff"): {"text", "json"},
     "runtime": {"text"},
     "runtime-host": {"text"},
@@ -306,10 +354,20 @@ def _set_format_choices(parser: argparse.ArgumentParser, path: tuple[str, ...] =
                 _set_format_choices(child, path + (name,))
 
 
-def _common(parser: argparse.ArgumentParser) -> None:
+def _common(parser: argparse.ArgumentParser, format_help: str = "Output format (default: text or exports.default_format).") -> None:
     parser.add_argument("--database", metavar="PATH", help="Override the local SQLite database path.")
     parser.add_argument("--format", choices=("text", "json", "markdown", "csv", "html", "mermaid", "dot"),
-                        help="Output format (default: text or exports.default_format).")
+                        help=format_help)
+
+
+def _print_preflight(queries, project: str) -> None:
+    """Show the static estimate without turning it into a safety guarantee."""
+    from .runtime.preflight import summary_line
+
+    try:
+        print(summary_line(queries.preflight(project)), file=sys.stderr)
+    except ThreadError as exc:
+        print(f"Pre-run static side-effect estimate unavailable: {exc}", file=sys.stderr)
 
 
 def _runtime_capture(parser: argparse.ArgumentParser) -> None:
@@ -402,16 +460,39 @@ def build_parser() -> argparse.ArgumentParser:
     profile_run.add_argument("--output-cap", type=int, default=100_000)
     _common(profile_run)
 
-    investigations = commands.add_parser("investigation", help="Save and resume named investigation context.")
+    export = commands.add_parser("export", help="Write a versioned, self-describing export of the latest completed scan.")
+    export.add_argument("project")
+    export.add_argument("--output", help="Optional destination; stdout otherwise.")
+    _common(export, "Export format (default: json).")
+
+    investigations = commands.add_parser("investigation", help="Save, resume, export, and import named investigation context.")
     investigation_commands = investigations.add_subparsers(dest="investigation_command", required=True)
     investigation_list = investigation_commands.add_parser("list", help="List a project's investigations.")
     investigation_list.add_argument("project")
     _common(investigation_list)
+    investigation_show = investigation_commands.add_parser("show", help="Show a saved investigation and its captured source references.")
+    investigation_show.add_argument("project")
+    investigation_show.add_argument("name")
+    _common(investigation_show)
+    investigation_resume = investigation_commands.add_parser("resume", help="Reopen an investigation and report changed, moved, or missing references.")
+    investigation_resume.add_argument("project")
+    investigation_resume.add_argument("name")
+    _common(investigation_resume)
     investigation_save = investigation_commands.add_parser("save", help="Save JSON notes and selected references for an investigation.")
     investigation_save.add_argument("project")
     investigation_save.add_argument("name")
-    investigation_save.add_argument("--content", default="{}", help="JSON object containing notes and selected references.")
+    investigation_save.add_argument("--content", default="{}", help="JSON object with files, symbols, events, notes, hypotheses, graphs, relationships, traces, experiments, and bookmarks.")
     _common(investigation_save)
+    investigation_export = investigation_commands.add_parser("export", help="Export an investigation with its source revision and limitations.")
+    investigation_export.add_argument("project")
+    investigation_export.add_argument("name")
+    investigation_export.add_argument("--output", help="Optional JSON destination.")
+    _common(investigation_export)
+    investigation_import = investigation_commands.add_parser("import", help="Import a portable investigation export into a project.")
+    investigation_import.add_argument("project")
+    investigation_import.add_argument("path")
+    investigation_import.add_argument("--name", help="Optional local investigation name.")
+    _common(investigation_import)
 
     experiments = commands.add_parser("experiment", help="Manage isolated, copy-based source experiments.")
     experiment_commands = experiments.add_subparsers(dest="experiment_command", required=True)
@@ -448,6 +529,10 @@ def build_parser() -> argparse.ArgumentParser:
     experiment_runs.add_argument("project")
     experiment_runs.add_argument("name")
     _common(experiment_runs)
+    experiment_preflight = experiment_commands.add_parser("preflight", help="Validate experiment rules and report precedence, aliases, limits, and replay controls without executing code.")
+    experiment_preflight.add_argument("project")
+    experiment_preflight.add_argument("name")
+    _common(experiment_preflight)
     experiment_capability = experiment_commands.add_parser("capability", help="Inspect support for one callable form in the experiment workspace.")
     experiment_capability.add_argument("project")
     experiment_capability.add_argument("name")
@@ -584,10 +669,21 @@ def build_parser() -> argparse.ArgumentParser:
     explain = commands.add_parser("explain", help="Explain an entry point, symbol, or project overview from stored evidence.")
     explain.add_argument("project")
     explain.add_argument("target")
-    explain.add_argument("--ai", action="store_true", help="Optionally generate an evidence-only narrative using local Ollama.")
-    explain.add_argument("--ai-model", help="Ollama model name (default: THREADTRACE_OLLAMA_MODEL or llama3.2).")
-    explain.add_argument("--ai-endpoint", help="Override the local Ollama endpoint.")
+    explain.add_argument("--ai", action="store_true", help="Optionally generate a validated interpretation using a configured provider.")
+    explain.add_argument("--ai-provider", choices=("ollama", "openai"), help="Local Ollama or an OpenAI-compatible provider.")
+    explain.add_argument("--ai-model", help="Provider model name (default: ai.model).")
+    explain.add_argument("--ai-endpoint", help="Provider endpoint URL (default: ai.endpoint or the provider's local URL).")
+    explain.add_argument("--ai-temperature", type=float, help="Sampling temperature from 0 to 2.")
+    explain.add_argument("--ai-tokens", type=int, help="Maximum generated tokens.")
+    explain.add_argument("--ai-template", help="Custom prompt template containing the {facts} placeholder.")
+    explain.add_argument("--ai-parameter", action="append", default=[], metavar="NAME=VALUE",
+                         help="Supported provider parameter; repeat to add more.")
+    explain.add_argument("--ai-show", action="store_true", help="Print the exact bounded payload and digest; send nothing.")
+    explain.add_argument("--ai-approve", metavar="SHA256", help="Approve this exact remote payload digest for one request.")
     _common(explain)
+    ai_history = commands.add_parser("ai-history", help="List stored AI interpretations and their deletion handles.")
+    ai_history.add_argument("project")
+    _common(ai_history)
     lesson = commands.add_parser("lesson", help="Create a deterministic teaching card for one function, method, or class.")
     lesson.add_argument("project")
     lesson.add_argument("symbol")
@@ -809,6 +905,22 @@ def _confirm_experiment_execution(confirmed: bool) -> None:
     print("Warning: experiment execution runs copied project code and is not a security sandbox.", file=sys.stderr)
 
 
+def _warn_experiment_preflight(engine, project: str, name: str) -> None:
+    """Report precedence, alias, and replay limits before any project code runs."""
+    report = engine.experiment_preflight(project, name)
+    notes = []
+    if report["shadowed"]:
+        notes.append(f"{len(report['shadowed'])} override rule(s) shadow lower-precedence rules")
+    if report["prebound_aliases"]:
+        notes.append(f"{len(report['prebound_aliases'])} pre-bound alias site(s) may keep the original value")
+    uncontrolled = report["replay"]["uncontrolled"]
+    if uncontrolled:
+        notes.append(f"{len(uncontrolled)} nondeterministic input(s) remain uncontrolled")
+    if notes:
+        print("Experiment preflight: " + "; ".join(notes) + ". Run 'threadtrace experiment preflight' for details.",
+              file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -817,9 +929,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
     if getattr(args, "format", None) is None:
-        configured = configuration["exports"]["default_format"]
+        configured = "json" if args.command == "export" else configuration["exports"]["default_format"]
         allowed = _formats(*_format_key(args)) if hasattr(args, "command") else ("text",)
-        args.format = configured if configured in allowed else "text"
+        args.format = configured if configured in allowed else ("json" if args.command == "export" else "text")
     try:
         _validate_format(args)
     except ThreadError as exc:
@@ -907,9 +1019,30 @@ def main(argv: list[str] | None = None) -> int:
                 )
             render(value, args.format)
             return 0
+        if args.command == "export":
+            text = _render_export(report_bundle(engine, queries, args.project), args.format)
+            if args.output:
+                print(f"Wrote {args.format} export to {write_text(args.output, text)}", file=sys.stderr)
+            else:
+                print(text)
+            return 0
         if args.command == "investigation":
             if args.investigation_command == "list":
                 value = engine.investigations(args.project)
+            elif args.investigation_command == "show":
+                value = engine.investigation(args.project, args.name)
+            elif args.investigation_command == "resume":
+                value = engine.resume_investigation(args.project, args.name)
+                for warning in value["warnings"]:
+                    print(f"Warning: {warning}", file=sys.stderr)
+            elif args.investigation_command == "export":
+                if args.output:
+                    print("Warning: investigation notes and source snippets may be sensitive; protect the output file.", file=sys.stderr)
+                value = engine.export_investigation(args.project, args.name, args.output)
+            elif args.investigation_command == "import":
+                value = engine.import_investigation(args.project, args.path, args.name)
+                for warning in value["warnings"]:
+                    print(f"Warning: {warning}", file=sys.stderr)
             else:
                 try:
                     content = json.loads(args.content)
@@ -945,10 +1078,14 @@ def main(argv: list[str] | None = None) -> int:
                 if args.output:
                     print("Warning: experiment exports may contain captured inputs, outputs, state, and source diffs. Protect the output file accordingly.", file=sys.stderr)
                 value = engine.export_experiment(args.project, args.name, args.output)
+            elif args.experiment_command == "preflight":
+                value = engine.experiment_preflight(args.project, args.name)
             elif args.experiment_command == "capability":
+                _warn_experiment_preflight(engine, args.project, args.name)
                 _confirm_experiment_execution(args.yes_run)
                 value = engine.experiment_capability(args.project, args.name, args.target, args.timeout, args.output_cap)
             elif args.experiment_command == "call":
+                _warn_experiment_preflight(engine, args.project, args.name)
                 _confirm_experiment_execution(args.yes_run)
                 operations = _json_value(args.operations, "Harness operations") if args.operations else None
                 if operations is None and not args.target:
@@ -957,13 +1094,16 @@ def main(argv: list[str] | None = None) -> int:
                                                    _json_object(args.kwargs, "Callable kwargs"), args.timeout, args.output_cap, operations,
                                                    _json_object(args.per_call, "Per-call configuration"))
             elif args.experiment_command == "explore":
+                _warn_experiment_preflight(engine, args.project, args.name)
                 _confirm_experiment_execution(args.yes_run)
                 cases = _json_value(args.cases, "Input cases") if args.cases else None
                 value = engine.explore_experiment(args.project, args.name, args.target, cases, args.timeout, args.output_cap)
             elif args.experiment_command == "replay":
+                _warn_experiment_preflight(engine, args.project, args.name)
                 _confirm_experiment_execution(args.yes_run)
                 value = engine.replay_experiment(args.project, args.name, args.run_id, args.timeout, args.output_cap)
             elif args.experiment_command == "compare":
+                _warn_experiment_preflight(engine, args.project, args.name)
                 _confirm_experiment_execution(args.yes_run)
                 value = engine.compare_experiment(args.project, args.name, args.target, _json_list(args.args, "Callable args"),
                                                   _json_object(args.kwargs, "Callable kwargs"), args.timeout, args.output_cap)
@@ -1006,6 +1146,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.no_redact and not args.yes_sensitive:
                 raise ThreadError("Unredacted capture can persist credentials and private data. Re-run with --no-redact --yes-sensitive to confirm.")
             effective = merge_config(configuration, engine.project_preferences(args.project))
+            _print_preflight(queries, args.project)
             value = engine.trace(
                 args.project, args.run_command, args.timeout, args.output_cap, args.cwd,
                 args.capture_level, args.capture_limit, not args.no_redact,
@@ -1028,6 +1169,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise ThreadError("Runtime capture limit must be positive.")
             if args.no_redact and not args.yes_sensitive:
                 raise ThreadError("Unredacted capture can persist credentials and private data. Re-run with --no-redact --yes-sensitive to confirm.")
+            _print_preflight(queries, args.project)
             RuntimeApp(
                 engine, args.project, args.run_command, args.timeout, args.output_cap,
                 cwd=Path(args.cwd).expanduser() if args.cwd else None,
@@ -1047,6 +1189,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise ThreadError("Runtime capture limit must be positive.")
             if args.no_redact and not args.yes_sensitive:
                 raise ThreadError("Unredacted capture can persist credentials and private data. Re-run with --no-redact --yes-sensitive to confirm.")
+            _print_preflight(queries, args.project)
             host = RuntimeHost(
                 Path(project["root_path"]), project["name"], args.run_command, args.event_cap,
                 Path(args.cwd).expanduser() if args.cwd else None, args.capture_level,
@@ -1082,7 +1225,8 @@ def main(argv: list[str] | None = None) -> int:
             except ModuleNotFoundError as exc:
                 raise ThreadError("The terminal explorer requires prompt_toolkit. Reinstall ThreadTrace with: uv pip install -e .") from exc
 
-            ThreadApp(engine, queries, args.project).run()
+            effective = merge_config(configuration, engine.project_preferences(args.project))
+            ThreadApp(engine, queries, args.project, effective["tui"], effective["ai"]).run()
             return 0
         if args.command == "browser":
             host = args.host or configuration["browser"]["host"]
@@ -1102,6 +1246,18 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command != "staleness":
             _warn_if_stale(queries, args.project)
+
+        def _explain() -> Any:
+            if not args.ai:
+                return queries.explain(args.project, args.target)
+            options = _ai_options(configuration, args)
+            if args.ai_show:
+                request = queries.ai_preview(args.project, args.target, options)
+                print(json.dumps(request, indent=2, default=_json_default), file=sys.stderr)
+                return {"approval_required": request["remote"], "digest": request["digest"],
+                        "notice": f"Review the payload on stderr, then run with --ai-approve {request['digest']}."}
+            return queries.ai_explain(args.project, args.target, options, _ai_approval(args))
+
         handlers: dict[str, Callable[[], Any]] = {
             "overview": lambda: queries.overview(args.project),
             "entrypoints": lambda: queries.entrypoints(args.project, args.kind),
@@ -1115,10 +1271,8 @@ def main(argv: list[str] | None = None) -> int:
             "complexity": lambda: queries.complexity(args.project, args.symbol),
             "advanced": lambda: queries.advanced(args.project, args.symbol),
             "resources": lambda: queries.resources(args.project, args.kind),
-            "explain": lambda: queries.ai_explain(
-                args.project, args.target, args.ai_model or configuration["ai"]["model"],
-                args.ai_endpoint or configuration["ai"]["endpoint"],
-            ) if args.ai else queries.explain(args.project, args.target),
+            "explain": _explain,
+            "ai-history": lambda: queries.ai_history(args.project),
             "lesson": lambda: queries.lesson(args.project, args.symbol),
             "compare": lambda: queries.compare(args.project, args.scan_a, args.scan_b),
             "traces": lambda: queries.traces(args.project),
@@ -1154,7 +1308,9 @@ def main(argv: list[str] | None = None) -> int:
             ),
         }
         value = handlers[args.command]()
-        if args.command == "architecture" and args.format in {"mermaid", "dot"}:
+        if args.command == "explain" and args.ai and not args.ai_show and args.format in {"text", "markdown"}:
+            print(value["narrative"])
+        elif args.command == "architecture" and args.format in {"mermaid", "dot"}:
             print(_graph_export(value, args.format))
         else:
             render(value, args.format)

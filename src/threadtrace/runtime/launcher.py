@@ -366,7 +366,7 @@ if _instrumentation in {"audit", "all"}:
     sys.addaudithook(_audit)
 _aux({"kind": "process", "lifecycle": "started", "ppid": os.getppid(), "executable": sys.executable,
       "argv": _argv, "interpreter_version": "%d.%d.%d" % sys.version_info[:3],
-      "instrumentation": _instrumentation})
+      "instrumentation": _instrumentation, "adapters": _threadtrace_runtime_adapters.statuses()})
 atexit.register(lambda: _aux({"kind": "process", "lifecycle": "ended"}))
 _waits.install(_aux, _root)
 '''

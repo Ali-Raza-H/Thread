@@ -771,7 +771,8 @@ def _emit_aux(item):
 
 def _process_lifecycle(lifecycle):
     _emit_aux({"kind": "process", "lifecycle": lifecycle, "ppid": os.getppid(),
-               "executable": sys.executable, "argv": _argv, "instrumentation": _instrumentation})
+               "executable": sys.executable, "argv": _argv, "instrumentation": _instrumentation,
+               "adapters": _threadtrace_runtime_adapters.statuses()})
 
 def _thread_lifecycle(thread_id, lifecycle):
     _emit_aux({"kind": "thread", "thread_id": thread_id, "lifecycle": lifecycle,
@@ -972,6 +973,8 @@ def _write_runtime_support(directory: Path, trace_source: str) -> None:
     (directory / "sitecustomize.py").write_text(trace_source, encoding="utf-8")
     adapter_source = Path(__file__).with_name("adapters.py").read_text(encoding="utf-8")
     (directory / "_threadtrace_runtime_adapters.py").write_text(adapter_source, encoding="utf-8")
+    versions_source = (Path(__file__).resolve().parent.parent / "adapter_versions.py").read_text(encoding="utf-8")
+    (directory / "_threadtrace_runtime_adapter_versions.py").write_text(versions_source, encoding="utf-8")
     value_source = Path(__file__).with_name("values.py").read_text(encoding="utf-8")
     (directory / "_threadtrace_runtime_values.py").write_text(value_source, encoding="utf-8")
     wait_source = Path(__file__).with_name("waits.py").read_text(encoding="utf-8")

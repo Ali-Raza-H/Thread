@@ -17,9 +17,10 @@ from typing import Any, Iterable
 
 from . import __version__
 from .config import application_directory, merge as merge_preferences, validate_preferences
-from .formats import EXPORT_SCHEMA_VERSION, TRACE_PROTOCOL_VERSION
+from .exports import envelope, source_state, truncations, write_text
+from .formats import EXPORT_FORMAT, EXPORT_SCHEMA_VERSION
 from .metadata import MetadataSnapshot, parse_metadata
-from .hybrid import compare_runs, create_workspace, explore_inputs, patch_file, run_harness, run_workspace, source_revision, validate_experiment_config, workspace_changes, workspace_diff
+from .hybrid import compare_runs, create_workspace, experiment_preflight as build_experiment_preflight, explore_inputs, patch_file, run_harness, run_workspace, source_revision, validate_experiment_config, workspace_changes, workspace_diff
 from .models import (AttributeRecord, BoundaryRecord, CallRecord, DefinitionRecord, FlowRecord, ImportRecord,
                      ParsedFile, ReferenceRecord, ScopeRecord, SymbolRecord)
 from .parser import classify_project_files, discover_python_files, discover_source_units
@@ -33,6 +34,8 @@ def now() -> str:
 
 
 _PYTHON_EXECUTABLE = re.compile(r"(python(\d+(\.\d+)*)?|py)(\.exe)?", re.IGNORECASE)
+_INVESTIGATION_SECTIONS = ("files", "symbols", "events", "notes", "hypotheses", "graphs",
+                           "relationships", "traces", "experiments", "bookmarks")
 _SECRET_ENVIRONMENT_NAMES = (
     "authorization", "password", "passwd", "secret", "token", "api_key", "apikey",
     "access_key", "client_secret", "session_key", "credential", "cookie", "private_key",
@@ -284,18 +287,193 @@ class Engine:
             row["content"] = json.loads(row.pop("content_json"))
         return rows
 
+    def investigation(self, project_ref: str, name: str) -> dict[str, Any]:
+        project = self.get_project(project_ref)
+        row = self.store.one("SELECT * FROM investigations WHERE project_id=? AND name=?", (project["project_id"], name))
+        if not row:
+            raise ThreadError(f"No investigation named '{name}' exists for this project.")
+        row["content"] = json.loads(row.pop("content_json"))
+        return row
+
     def save_investigation(self, project_ref: str, name: str, content: dict[str, Any]) -> dict[str, Any]:
         if not name.strip():
             raise ThreadError("An investigation needs a name.")
         project = self.get_project(project_ref)
+        content = self._investigation_content(project, content)
         timestamp = now()
         with self.store.transaction():
-            existing = self.store.one("SELECT investigation_id,created_at FROM investigations WHERE project_id=? AND name=?", (project["project_id"], name))
+            existing = self.store.one("SELECT investigation_id,content_json FROM investigations WHERE project_id=? AND name=?",
+                                      (project["project_id"], name))
             if existing:
-                self.store.execute("UPDATE investigations SET content_json=?,updated_at=? WHERE investigation_id=?", (self.store.json(content), timestamp, existing["investigation_id"]))
+                content["source"] = self._merge_snapshots(json.loads(existing["content_json"]), content)
+                self.store.execute("UPDATE investigations SET content_json=?,updated_at=? WHERE investigation_id=?",
+                                   (self.store.json(content), timestamp, existing["investigation_id"]))
             else:
-                self.store.execute("INSERT INTO investigations VALUES(?,?,?,?,?,?)", (identifier(), project["project_id"], name, timestamp, timestamp, self.store.json(content)))
-        return next(row for row in self.investigations(project_ref) if row["name"] == name)
+                self.store.execute("INSERT INTO investigations VALUES(?,?,?,?,?,?)",
+                                   (identifier(), project["project_id"], name, timestamp, timestamp, self.store.json(content)))
+        return self.investigation(project_ref, name)
+
+    def resume_investigation(self, project_ref: str, name: str) -> dict[str, Any]:
+        """Reopen saved references against the latest scan without moving them."""
+        investigation = self.investigation(project_ref, name)
+        project = self.get_project(project_ref)
+        content = investigation["content"]
+        scan_id = self._latest_scan_id(project)
+        current = {row["relative_path"]: row["content_hash"] for row in self.store.rows(
+            "SELECT relative_path,content_hash FROM files WHERE scan_id=?", (scan_id,))} if scan_id else {}
+        warnings: list[str] = []
+        references = []
+        for snapshot in content.get("source") or []:
+            if not isinstance(snapshot, dict) or not snapshot.get("path"):
+                continue
+            path, saved_hash = snapshot["path"], snapshot.get("sha256")
+            status = "unchanged"
+            if path not in current:
+                status = "missing"
+                warnings.append(f"{path} is not part of the latest scan; the saved location and snippet were kept.")
+            elif current[path] != saved_hash:
+                status = "changed"
+                warnings.append(f"{path} changed since the investigation was saved; verify the saved location before relying on it.")
+                if snapshot.get("symbol") and not self._symbol_exists(scan_id, path, snapshot["symbol"]):
+                    status = "moved"
+                    warnings.append(f"{snapshot['symbol']} was not found at {path}:{snapshot.get('line')} in the latest scan.")
+            references.append({"path": path, "line": snapshot.get("line"), "symbol": snapshot.get("symbol"),
+                               "saved_sha256": saved_hash, "current_sha256": current.get(path), "status": status})
+        if scan_id and content.get("scan_id") != scan_id:
+            warnings.append("The investigation was saved against a different scan; stored locations are historical.")
+        traces = []
+        for reference in content.get("traces") or []:
+            trace_id = reference.get("trace_id") if isinstance(reference, dict) else reference
+            if not isinstance(trace_id, str):
+                continue
+            available = bool(self.store.one(
+                "SELECT 1 FROM runtime_traces t JOIN projects p ON p.project_id=t.project_id WHERE t.trace_id=? AND p.project_id=?",
+                (trace_id, project["project_id"])))
+            if not available:
+                warnings.append(f"Runtime trace {trace_id} is no longer stored.")
+            traces.append({"trace_id": trace_id, "available": available})
+        investigation.update({"current_scan_id": scan_id, "references": references, "traces": traces, "warnings": warnings})
+        return investigation
+
+    def export_investigation(self, project_ref: str, name: str, output: str | None = None) -> dict[str, Any]:
+        resumed = self.resume_investigation(project_ref, name)
+        project = self.get_project(project_ref)
+        content = resumed["content"]
+        scan_id = content.get("scan_id")
+        row = self.store.one("SELECT * FROM scans WHERE scan_id=?", (scan_id,)) if scan_id else None
+        scan = None
+        if row:
+            row["summary"] = json.loads(row.pop("summary_json", "{}") or "{}")
+            scan = row
+        bundle = envelope(
+            "investigation", project=project, scan=scan, schema_version=self.store.schema_version,
+            source=source_state(self.store, scan_id), truncation=truncations(content),
+            limitations=("Stored locations and snippets are historical captures; resume them before relying on current source.",),
+        )
+        bundle["payload"] = {"name": name, "content": content, "references": resumed["references"],
+                             "traces": resumed["traces"], "warnings": resumed["warnings"]}
+        if output:
+            bundle["output_path"] = str(write_text(output, json.dumps(bundle, indent=2, sort_keys=True)))
+        return bundle
+
+    def import_investigation(self, project_ref: str, source: str, name: str | None = None) -> dict[str, Any]:
+        path = Path(source).expanduser()
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ThreadError(f"Could not read investigation export: {exc}") from exc
+        try:
+            bundle = json.loads(text)
+        except json.JSONDecodeError:
+            raise ThreadError("That file is not a ThreadTrace export.") from None
+        if not isinstance(bundle, dict) or bundle.get("format") != EXPORT_FORMAT:
+            raise ThreadError("That file is not a ThreadTrace export.")
+        version = bundle.get("export_version")
+        if not isinstance(version, int) or version > EXPORT_SCHEMA_VERSION:
+            raise ThreadError(f"Export version {version!r} is newer than this ThreadTrace supports ({EXPORT_SCHEMA_VERSION}).")
+        if bundle.get("payload_type") != "investigation":
+            raise ThreadError("That export does not contain an investigation.")
+        payload = bundle.get("payload") or {}
+        content = payload.get("content")
+        if not isinstance(content, dict):
+            raise ThreadError("The exported investigation has no content.")
+        target = (name or payload.get("name") or path.stem).strip()
+        saved = self.save_investigation(project_ref, target, content)
+        resumed = self.resume_investigation(project_ref, target)
+        return {"name": saved["name"], "investigation": saved, "export_version": version,
+                "application_version": bundle.get("application_version"), "exported_at": bundle.get("generated_at"),
+                "source_project": (bundle.get("project") or {}).get("name"), "source_scan_id": bundle.get("scan_id"),
+                "current_scan_id": resumed["current_scan_id"], "references": resumed["references"],
+                "traces": resumed["traces"], "warnings": resumed["warnings"]}
+
+    def _investigation_content(self, project: dict[str, Any], content: dict[str, Any]) -> dict[str, Any]:
+        """Normalise the documented sections and capture referenced source."""
+        if not isinstance(content, dict):
+            raise ThreadError("Investigation content must be a JSON object.")
+        normalised = dict(content)
+        for section in _INVESTIGATION_SECTIONS:
+            value = normalised.get(section, [])
+            if isinstance(value, str):
+                value = [{"text": value}]
+            elif isinstance(value, dict):
+                value = [value]
+            if not isinstance(value, list) or not all(isinstance(item, (dict, str)) for item in value):
+                raise ThreadError(f"Investigation '{section}' must be a list of objects or text.")
+            normalised[section] = value
+        normalised["scan_id"] = normalised.get("scan_id") or self._latest_scan_id(project)
+        captured = self._capture_snapshots(project, normalised)
+        provided = [item for item in normalised.get("source") or [] if isinstance(item, dict)]
+        normalised["source"] = self._merge_snapshots({"source": captured}, {"source": provided})
+        return normalised
+
+    def _capture_snapshots(self, project: dict[str, Any], content: dict[str, Any]) -> list[dict[str, Any]]:
+        """Keep the exact snippet and hash behind each saved source reference."""
+        root = Path(project["root_path"]).resolve()
+        captured = []
+        for section in ("files", "symbols", "events"):
+            for reference in content[section]:
+                if not isinstance(reference, dict) or not isinstance(reference.get("path"), str) or not reference["path"]:
+                    continue
+                target = (root / reference["path"]).resolve()
+                try:
+                    target.relative_to(root)
+                except ValueError:
+                    continue
+                if not target.is_file():
+                    continue
+                try:
+                    text = target.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue
+                line = reference.get("line") if isinstance(reference.get("line"), int) else None
+                start = max(1, (line or 1) - 2)
+                captured.append({
+                    "path": reference["path"], "line": line,
+                    "symbol": reference.get("qualified_name") or reference.get("symbol"),
+                    "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+                    "snippet": "\n".join(text.splitlines()[start - 1:start + 39])[:4000], "captured_at": now(),
+                })
+        return captured
+
+    @staticmethod
+    def _merge_snapshots(existing: dict[str, Any], content: dict[str, Any]) -> list[dict[str, Any]]:
+        merged: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+        for snapshot in list(existing.get("source") or []) + content["source"]:
+            if isinstance(snapshot, dict) and snapshot.get("path"):
+                merged[(snapshot["path"], snapshot.get("line"), snapshot.get("symbol"))] = snapshot
+        return list(merged.values())
+
+    def _latest_scan_id(self, project: dict[str, Any]) -> str | None:
+        row = self.store.one(
+            "SELECT scan_id FROM scans WHERE project_id=? AND status='completed' ORDER BY completed_at DESC LIMIT 1",
+            (project["project_id"],))
+        return row["scan_id"] if row else None
+
+    def _symbol_exists(self, scan_id: str | None, path: str, symbol: str) -> bool:
+        return bool(scan_id and self.store.one(
+            "SELECT 1 FROM symbols s JOIN files f ON f.file_id=s.file_id "
+            "WHERE s.scan_id=? AND f.relative_path=? AND (s.qualified_name=? OR s.name=?)",
+            (scan_id, path, symbol, symbol)))
 
     def bookmark_trace(self, project_ref: str, trace_id: str, ordinal: int, label: str, note: str = "") -> dict[str, Any]:
         if ordinal < 1 or not label.strip():
@@ -397,7 +575,8 @@ class Engine:
         allowed = {
             "patches", "substitutions", "disabled_modules", "mocks", "overrides", "argument_overrides",
             "line_overrides", "adapters", "fixtures", "setup_code", "allow_expressions", "input_generators",
-            "yield_cap", "event_cap", "environment", "seed", "freeze_time", "uuid", "float_tolerance",
+            "yield_cap", "event_cap", "environment", "seed", "freeze_time", "uuid", "float_tolerance", "interpreter",
+            "budgets",
         }
         unknown = sorted(set(config) - allowed)
         if unknown:
@@ -461,6 +640,7 @@ class Engine:
         """Invoke a copied-workspace callable or a persistent class-operation sequence."""
         experiment = self._experiment(project_ref, name)
         config = json.loads(experiment["config_json"])
+        workspace = Path(experiment["workspace_path"])
         request: dict[str, Any] = {"config": config}
         if per_call:
             request["per_call"] = per_call
@@ -475,9 +655,10 @@ class Engine:
                 raise ThreadError("Callable args must be a JSON list and kwargs must be a JSON object.")
             request.update({"target": target, "args": args or [], "kwargs": kwargs or {}})
         try:
-            result = run_harness(Path(experiment["workspace_path"]), request, timeout, output_cap)
+            result = run_harness(workspace, request, timeout, output_cap, config.get("interpreter"))
         except (OSError, ValueError) as exc:
             raise ThreadError(f"Could not run callable experiment: {exc}") from exc
+        result.setdefault("preflight", build_experiment_preflight(workspace, config))
         result["run_id"] = self._record_experiment_run(experiment["experiment_id"], "harness", request, result)
         self._touch_experiment(experiment["experiment_id"], "ran")
         return result
@@ -487,11 +668,13 @@ class Engine:
         experiment = self._experiment(project_ref, name)
         if cases is not None and not isinstance(cases, list):
             raise ThreadError("Input cases must be a JSON list.")
+        config = json.loads(experiment["config_json"])
         try:
-            result = explore_inputs(Path(experiment["workspace_path"]), target, cases,
-                                    json.loads(experiment["config_json"]), timeout, output_cap)
+            result = explore_inputs(Path(experiment["workspace_path"]), target, cases, config, timeout, output_cap,
+                                    config.get("interpreter"))
         except (OSError, ValueError) as exc:
             raise ThreadError(f"Could not explore callable inputs: {exc}") from exc
+        result["preflight"] = build_experiment_preflight(Path(experiment["workspace_path"]), config)
         self._record_experiment_run(experiment["experiment_id"], "exploration", {"target": target, "cases": cases}, result)
         self._touch_experiment(experiment["experiment_id"], "explored")
         return result
@@ -513,16 +696,20 @@ class Engine:
         request = json.loads(stored["request_json"])
         if "target" not in request and "operations" not in request:
             raise ThreadError("Only callable harness runs can be replayed.")
+        config = json.loads(experiment["config_json"])
+        workspace = Path(experiment["workspace_path"])
         try:
-            result = run_harness(Path(experiment["workspace_path"]), request, timeout, output_cap)
-            confirmation = run_harness(Path(experiment["workspace_path"]), request, timeout, output_cap)
+            result = run_harness(workspace, request, timeout, output_cap, config.get("interpreter"))
+            confirmation = run_harness(workspace, request, timeout, output_cap, config.get("interpreter"))
         except (OSError, ValueError) as exc:
             raise ThreadError(f"Could not replay experiment: {exc}") from exc
+        tolerance = float(config.get("float_tolerance", 1e-9))
         original = json.loads(stored["result_json"])
-        comparison = compare_runs(original, result, float(json.loads(experiment["config_json"]).get("float_tolerance", 1e-9)))
-        repeat = compare_runs(result, confirmation, float(json.loads(experiment["config_json"]).get("float_tolerance", 1e-9)))
+        comparison = compare_runs(original, result, tolerance)
+        repeat = compare_runs(result, confirmation, tolerance)
         replay = {"replayed_run_id": run_id, "result": result, "comparison": comparison,
-                  "deterministic": repeat["same_behaviour"], "nondeterminism": repeat["differences"] + repeat["unknown_comparisons"]}
+                  "deterministic": repeat["same_behaviour"], "nondeterminism": repeat["differences"] + repeat["unknown_comparisons"],
+                  "preflight": build_experiment_preflight(workspace, config)}
         replay["replay_run_id"] = self._record_experiment_run(experiment["experiment_id"], "replay", request, replay)
         return replay
 
@@ -536,6 +723,7 @@ class Engine:
         source = Path(project["root_path"])
         baseline_revision = json.loads(experiment["baseline_revision_json"])
         config = json.loads(experiment["config_json"])
+        interpreter = config.get("interpreter")
         try:
             current_revision = source_revision(source)
             if current_revision != baseline_revision:
@@ -555,47 +743,62 @@ class Engine:
                     raise ThreadError("Registered source changed while the baseline comparison copy was being created. Try again.")
                 if source_revision(modified_workspace) != modified_revision:
                     raise ThreadError("Experiment source changed while the modified comparison copy was being created. Try again.")
-                baseline = run_harness(baseline_workspace, {**request, "config": {}}, timeout, output_cap)
-                modified = run_harness(modified_workspace, {**request, "config": config}, timeout, output_cap)
+                baseline = run_harness(baseline_workspace, {**request, "config": {}}, timeout, output_cap, interpreter)
+                modified = run_harness(modified_workspace, {**request, "config": config}, timeout, output_cap, interpreter)
         except (OSError, ValueError) as exc:
             raise ThreadError(f"Could not compare experiment behaviour: {exc}") from exc
         tolerance = float(config.get("float_tolerance", 1e-9))
         result = compare_runs(baseline, modified, tolerance)
-        result["baseline"].update(self._comparison_provenance("baseline", baseline_revision, {}))
-        result["modified"].update(self._comparison_provenance("modified", modified_revision, config))
+        result["preflight"] = build_experiment_preflight(Path(experiment["workspace_path"]), config)
+        result["baseline"].update(self._comparison_provenance("baseline", baseline_revision, {}, interpreter))
+        result["modified"].update(self._comparison_provenance("modified", modified_revision, config, interpreter))
         run_id = self._record_experiment_run(experiment["experiment_id"], "comparison", request, result)
         return {"run_id": run_id, **result}
 
     def experiment_capability(self, project_ref: str, name: str, target: str, timeout: int = 30,
                               output_cap: int = 100_000) -> dict[str, Any]:
         experiment = self._experiment(project_ref, name)
-        request = {"action": "capability", "target": target, "config": json.loads(experiment["config_json"])}
+        config = json.loads(experiment["config_json"])
+        request = {"action": "capability", "target": target, "config": config}
         try:
-            return run_harness(Path(experiment["workspace_path"]), request, timeout, output_cap)
+            return run_harness(Path(experiment["workspace_path"]), request, timeout, output_cap, config.get("interpreter"))
         except (OSError, ValueError) as exc:
             raise ThreadError(f"Could not inspect callable capability: {exc}") from exc
+
+    def experiment_preflight(self, project_ref: str, name: str) -> dict[str, Any]:
+        """Validate experiment rules and report precedence, aliases, limits, and replay controls."""
+        experiment = self._experiment(project_ref, name)
+        try:
+            return build_experiment_preflight(Path(experiment["workspace_path"]), json.loads(experiment["config_json"]))
+        except (TypeError, ValueError) as exc:
+            raise ThreadError(f"Invalid experiment configuration: {exc}") from exc
 
     def export_experiment(self, project_ref: str, name: str, output: str | None = None) -> dict[str, Any]:
         experiment = self._experiment(project_ref, name)
         project = self.get_project(project_ref)
-        bundle = {
-            "format_version": EXPORT_SCHEMA_VERSION, "application_version": __version__,
-            "database_schema_version": self.store.connection.execute("PRAGMA user_version").fetchone()[0],
-            "trace_protocol_version": TRACE_PROTOCOL_VERSION,
-            "project": project["name"], "experiment": name,
-            "config": json.loads(experiment["config_json"]),
+        scan_id = self._latest_scan_id(project)
+        row = self.store.one("SELECT * FROM scans WHERE scan_id=?", (scan_id,)) if scan_id else None
+        scan = None
+        if row:
+            row["summary"] = json.loads(row.pop("summary_json", "{}") or "{}")
+            scan = row
+        runs = self.experiment_runs(project_ref, name)
+        payload = {
+            "experiment": name, "config": json.loads(experiment["config_json"]),
             "baseline_revision": json.loads(experiment["baseline_revision_json"]) if experiment.get("baseline_revision_json") else None,
             "workspace_diff": workspace_diff(Path(project["root_path"]), Path(experiment["workspace_path"])),
             "workspace_changes": workspace_changes(Path(project["root_path"]), Path(experiment["workspace_path"])),
-            "patches": self.experiment_patches(project_ref, name),
-            "runs": self.experiment_runs(project_ref, name), "exported_at": now(),
+            "patches": self.experiment_patches(project_ref, name), "runs": runs,
         }
+        bundle = envelope(
+            "experiment", project=project, scan=scan, schema_version=self.store.schema_version,
+            source=source_state(self.store, scan_id), run_ids=[run["run_id"] for run in runs],
+            truncation=truncations(payload),
+            limitations=("Experiments execute copied source and are not an OS sandbox; captured inputs and outputs may be sensitive.",),
+        )
+        bundle["payload"] = payload
         if output:
-            path = Path(output).expanduser()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(bundle, indent=2, sort_keys=True), encoding="utf-8")
-            path.chmod(0o600)
-            bundle["output_path"] = str(path.resolve())
+            bundle["output_path"] = str(write_text(output, json.dumps(bundle, indent=2, sort_keys=True)))
         return bundle
 
     def _experiment(self, project_ref: str, name: str) -> dict[str, Any]:
@@ -620,8 +823,9 @@ class Engine:
         }
 
     @staticmethod
-    def _comparison_provenance(role: str, revision: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-        executable = Path(sys.executable)
+    def _comparison_provenance(role: str, revision: dict[str, Any], config: dict[str, Any],
+                               interpreter: str | None = None) -> dict[str, Any]:
+        executable = Path(interpreter or sys.executable)
         return {
             "workspace_role": role,
             "source_revision": revision,
@@ -678,7 +882,18 @@ class Engine:
             raise ThreadError("Instrumentation must be auto, settrace, monitoring, profile, audit, or all.")
         project = self.get_project(project_ref)
         from .runtime.launcher import run_python_trace
+        from .runtime.preflight import summarize as summarize_preflight
 
+        scan = self.store.one(
+            "SELECT scan_id FROM scans WHERE project_id=? AND status='completed' ORDER BY completed_at DESC LIMIT 1",
+            (project["project_id"],),
+        )
+        preflight = summarize_preflight(self.store.rows(
+            "SELECT kind,name,operation,module_name,confidence FROM resources WHERE scan_id=?",
+            (scan["scan_id"],),
+        )) if scan else {"status": "unavailable", "guarantee": False, "counts": {}, "examples": {},
+                      "limitations": ["Run 'threadtrace scan PROJECT' to build a static side-effect estimate."]}
+        preflight["scan_id"] = scan["scan_id"] if scan else None
         try:
             result = run_python_trace(
                 Path(project["root_path"]), command, timeout, output_cap,
@@ -688,6 +903,7 @@ class Engine:
             )
         except (OSError, ValueError) as exc:
             raise ThreadError(f"Trace could not start: {exc}") from exc
+        result["preflight"] = preflight
         if not save:
             return {**result, "trace_id": None, "scan_id": None, "persisted": False}
         return self.record_runtime(project_ref, result)
@@ -700,6 +916,7 @@ class Engine:
             (project["project_id"],),
         )
         trace_id = identifier()
+        launch = {**(result.get("launch") or {}), "preflight": result.get("preflight")}
         with self.store.transaction():
             self.store.execute(
                 """INSERT INTO runtime_traces(trace_id,project_id,scan_id,command_json,started_at,finished_at,
@@ -710,7 +927,7 @@ class Engine:
                  result["exit_code"], int(result["timed_out"]), result["stdout"], result["stderr"],
                  len(result["events"]), result.get("cwd"), result.get("capture_level", "metadata"),
                  result.get("capture_limit", 4096), int(result.get("redaction_enabled", True)),
-                 self.store.json(result.get("launch") or {})),
+                 self.store.json(launch)),
             )
             from .runtime.schema import normalise_event
             for ordinal, event in enumerate(result["events"], 1):

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from .evidence import record
+from .test_evidence import CAPABILITY_TESTS, VERIFIED_PYTHON
 
 
 CAPABILITIES: tuple[dict[str, str], ...] = (
@@ -72,7 +73,7 @@ CAPABILITIES: tuple[dict[str, str], ...] = (
         "area": "Runtime",
         "feature": "Runtime resource adapters",
         "status": "Partial",
-        "details": "Explicit traces support bounded, redacted HTTP, SQLite/SQLAlchemy/Django, filesystem, and JSON/pickle events with initiating frames and timing. Safe wrappers publish final completed/failed status after return, while audit-only evidence is attempted and correlated. URL credentials/query values, headers, cookies, database parameters, sensitive environment values, exceptions, bytes, and nested structures are redacted by default with explicit truncation. Native/unverified drivers, packet inspection, and operations without a project Python origin are unavailable.",
+        "details": "Explicit traces support bounded, redacted HTTP, Python-level TCP, FTP/FTPS command, SQLite/SQLAlchemy/Django, filesystem, and JSON/pickle events with initiating frames and timing. Adapter versions are compared with tested minimums; `trace-resources` exposes supported, unsupported, and not-installed status plus observed operation counts and durations. Database transaction, savepoint, release, commit, and rollback operations are recorded where exposed, with nested semantics Partial. Safe wrappers publish final completed/failed status after return, while audit-only evidence is attempted and correlated. A pre-run static side-effect estimate is shown before explicit tracing and is not a security guarantee. URL credentials/query values, headers, cookies, database parameters, sensitive environment values, exceptions, bytes, and nested structures are redacted by default with explicit truncation. Native/unverified drivers, packet/TLS inspection, and operations without a project Python origin are unavailable.",
     },
     {
         "area": "Runtime",
@@ -91,19 +92,46 @@ CAPABILITIES: tuple[dict[str, str], ...] = (
         "feature": "Copy-based patches, callable harnesses, controlled substitutions, replay, and comparisons",
         "status": "Full",
         "verified": True,
-        "details": "The documented Hybrid workflow is implemented: private workspaces, callable/class sessions, typed and recorded inputs, live line overrides, descriptor-aware syntax-checked atomic patches with hash history, substitutions, mocks, HTTP/SQLite/filesystem/network/process adapters, generated input cases, deterministic replay, side-effect evidence, source-revision-checked baseline comparison, complete workspace change reports, verified experiment cleanup on project removal, persistence, and export. Comparisons run fresh baseline and modified copies in separate child processes and record both source revisions, configurations, and interpreters. Each selected callable reports Full/Partial support; closure cells and native implementations expose their Python limits. A Hybrid process is controlled but is not an OS security sandbox.",
+        "details": "The documented Hybrid workflow is implemented: private workspaces, callable/class sessions, typed and recorded inputs, live line overrides, descriptor-aware syntax-checked atomic patches with hash history, substitutions, mocks, HTTP/SQLite/filesystem/network/process adapters, generated input cases, deterministic replay, side-effect evidence, source-revision-checked baseline comparison, complete workspace change reports, verified experiment cleanup on project removal, persistence, and export. Precedence is enforced as override, named patch/substitution, adapter, then original; same-level collisions are rejected and shadowed rules, pre-bound aliases, active-frame limits, controlled inputs, and uncontrolled nondeterminism are reported before execution. Harness workers can use a selected interpreter, run in killed-on-timeout process groups, and hash files in bounded chunks. Comparisons run fresh baseline and modified copies in separate child processes, record both source revisions, configurations, and interpreters, and return unknown rather than equality for truncated values. Adapter rules cannot silently perform a replaced or denied operation; pass-through must be explicit, and records use runtime-compatible resource/status/version fields with latency, failures, database transactions, filesystem reads, and optional `max_cases`, `global_timeout`, `case_timeout`, `max_events`, `max_output`, `max_memory_bytes`, and `max_storage_bytes` budgets. Exploration retains minimal reproducing cases with reasons and labels expression generators as explicit execution; coverage-guided and general fuzzing remain later/experimental. Each selected callable reports Full/Partial support; closure cells and native implementations expose their Python limits. A Hybrid process is controlled but is not an OS security sandbox.",
     },
     {
         "area": "Interfaces",
         "feature": "Configuration and persistence lifecycle",
         "status": "Partial",
-        "details": "A versioned nonsecret YAML subset validates storage, discovery globs, profiles, TUI/browser settings, runtime budgets, exports, and local AI settings; duplicate, unknown, secret-looking, and invalid fields are rejected. Per-project preferences live in the database and override global defaults. Storage usage, quota thresholds, explicit retention pruning, trace-saving policy, and confirmed deletion of traces, reports, projects, or all local records are available. Older schemas are backed up and restored if migration fails. SQLite uses WAL, foreign keys, a five-second busy timeout, and restrictive local permissions where supported.",
+        "details": "A versioned nonsecret YAML subset validates storage, discovery globs, profiles, TUI/browser settings, runtime budgets, exports, and provider-independent AI settings with nonsecret options; duplicate, unknown, secret-looking, and invalid fields are rejected. Per-project preferences live in the database and override global defaults. Storage usage, quota thresholds, explicit retention pruning, trace-saving policy, and confirmed deletion of traces, reports, projects, or all local records are available. Older schemas are backed up and restored if migration fails. SQLite uses WAL, foreign keys, a five-second busy timeout, and restrictive local permissions where supported.",
+    },
+    {
+        "area": "Interfaces",
+        "feature": "Launch profiles, investigations, and trace bookmarks",
+        "status": "Full",
+        "verified": True,
+        "details": "Named launch commands persist locally and execute their configured Python interpreter, nonsecret environment overrides/removals, and working directory; each trace records the resolved executable, interpreter version, and environment policy. Secret-named overrides are rejected. Investigations persist files, symbols, events, notes, hypotheses, graphs, relationships, traces, experiments, and bookmarks, capturing a source hash, bounded snippet, and timestamp for each referenced file, symbol, or event. Resume reports unchanged, changed, moved, and missing references against the latest scan without relocating stored locations; export and import round-trip the workspace through the shared export envelope, reject unknown newer versions, and warn on source-revision mismatch. Trace-event inspection and labelled event bookmarks persist.",
+    },
+    {
+        "area": "Interfaces",
+        "feature": "Compatibility and automated evidence",
+        "status": "Full",
+        "verified": True,
+        "details": "Claims are tied to offline automated evidence on a verified interpreter. Deterministic fixtures cover scripts, packages, namespace packages, malformed projects, argparse/Click/Typer, Flask/FastAPI/Django, SQLite/SQLAlchemy, threads, asyncio, multiprocessing, imports/re-exports, exceptions/patches, and resource adapters; each scan must leave the target unimported, unexecuted, and free of bytecode caches. A labelled heuristic corpus measures confirmed-call precision and recall, and a capability manifest names the tests behind every Full, Partial, or Unsupported row. Safety gates cover corrupt databases and exports, bounded CLI failures, and snapshot path escape; measured scan, query, export, storage, and size bounds are enforced with generous ceilings. Classifiers and `requires-python` advertise only the verified CPython release, and the `dev` extra installs the documented pytest runner.",
+    },
+    {
+        "area": "Interfaces",
+        "feature": "Portable exports and read-only Python API",
+        "status": "Full",
+        "verified": True,
+        "details": "Every portable artifact shares one envelope with the export format version, application/database schema/trace protocol versions, payload type, generation time, project and scan identifiers, run IDs, source file and scan-input hashes, capability status, limitations, and stored truncation markers. `threadtrace export` renders the latest completed scan as JSON, Markdown, CSV, HTML, Mermaid, or DOT from the same bundle; HTML is self-contained and escapes target-controlled text, while non-JSON formats carry the envelope as a metadata section or comment lines. Experiment and investigation exports use the same envelope, and written files use restrictive permissions. The experimental `ThreadTrace` Python facade exposes projects, scans, a whitelisted set of read-only queries, traces, investigations, and report exports; Hybrid execution stays in `HybridHarness`.",
+    },
+    {
+        "area": "Interfaces",
+        "feature": "Optional provider-independent AI assistance",
+        "status": "Partial",
+        "details": "Ollama and OpenAI-compatible providers share validated nonsecret settings for endpoint, model, temperature, generation limit, timeout, credential variable, custom template, and supported provider parameters. Credentials come only from the environment or a mode-0600 application-directory .env and are never prompted, persisted, exported, or logged; credentials in endpoint URLs are rejected. Requests receive a depth/item/string-bounded and best-effort redacted subset of stored facts, never whole repositories or environments. Loopback endpoints are local; every remote endpoint requires a matching SHA-256 approval of the exact redacted payload, shown with --ai-show or an interactive confirmation. Providers must return JSON with a summary, claims citing stored path:line locations, and an optional Mermaid diagram whose node labels must exist in the stored analysis; invalid JSON, invented references, and malformed diagrams are rejected. Each exchange persists the prompt, manifest, digest, validated response, settings, timestamp, and evidence links; ai-history, report deletion, and scan retention manage it. AI output is labelled interpretation and cannot edit source or execute code.",
     },
     {
         "area": "Interfaces",
         "feature": "Terminal explorer and local browser companion",
         "status": "Partial",
-        "details": "The browser companion is read-only, binds only to loopback, and presents stored static results through a single-threaded local server. Requests may briefly queue, and the interface does not control a target process. CLI report commands support text, JSON, Markdown, CSV, and HTML; architecture adds Mermaid and DOT. Unsupported command/format pairs and expected configuration/database/migration failures exit with code 2 without a traceback.",
+        "details": "The terminal explorer uses the normal three-pane layout at 80x20 or larger and switches to a compact single pane below it, including after a resize. View keys are configurable with collision validation, a command palette lists every main action, and Unicode/ASCII and colour/no-colour modes keep text status cues. Source views highlight Python, navigate to definitions and references, and edit only inside the registered project with a syntax check, read-only diff confirmation, open-file hash verification, and an atomic same-directory write; rescans preserve the current view and selected result. The browser companion is a read-only, loopback-only graph explorer for the latest completed scan. It exposes paginated JSON for dependency/import, call, class/module, AST, data-flow, control-flow, and evidence-supported execution-flow views; supports pan, zoom, label/relationship/evidence filtering, focus, hop expansion, bounded source navigation, and Mermaid export from the same model; and shows evidence class, capability status, truncation, staleness, and source location. Requests must match the bound loopback Host and Origin and use GET; the single-threaded server may briefly queue requests and never controls a target process. CLI report commands support text, JSON, Markdown, CSV, HTML, Mermaid, and DOT where supported; unsupported command/format pairs and expected configuration/database/migration failures exit with code 2 without a traceback.",
     },
 )
 
@@ -141,7 +169,8 @@ LIMITATIONS = {
         ("Only statement-start lines and directly observable branch bodies are reconstructed.",
          "Imported coverage.py data keeps separate provenance and is never merged into native coverage."),
     "Runtime resource adapters":
-        ("Native drivers, packet/TLS inspection, and operations without a project Python origin are unavailable.",),
+        ("Native drivers, packet/TLS inspection or decryption, nested savepoint semantics, and operations without a project Python origin remain unavailable.",
+         "Adapter timing is observed operation duration, not isolated wrapper overhead; the pre-run static estimate is not a security guarantee."),
     "Local Host/Listener sessions":
         ("Windows IPC is unavailable, the listener is read-only, and a target can escape process-group cleanup by starting a new session.",),
     "Existing-process attachment and child-process inheritance":
@@ -151,8 +180,20 @@ LIMITATIONS = {
     "Configuration and persistence lifecycle":
         ("Quota thresholds are reported rather than automatically enforced; pruning and deletion are explicit local actions.",
          "Windows ACL and retention scheduler behaviour may differ from POSIX permissions."),
+    "Launch profiles, investigations, and trace bookmarks":
+        ("Investigation snippets are bounded historical captures; changed source must be read from the current revision.",),
+    "Compatibility and automated evidence":
+        ("Verification covers CPython 3.11 on Linux; newer CPython releases and non-CPython interpreters remain static-only until tested.",
+         "The accuracy corpus is curated and small, so measured precision/recall describes its documented cases rather than every project."),
+    "Portable exports and read-only Python API":
+        ("Report exports describe one stored scan; runtime behaviour and files changed after that scan are not revalidated.",
+         "Imported investigations keep their stored paths and hashes instead of being relocated to the importing project."),
+    "Optional provider-independent AI assistance":
+        ("Automated coverage uses fake providers; real model quality and provider-specific API differences are not verified.",
+         "Redaction is best-effort pattern matching, and remote approval is manual by design; the explorer refuses remote requests because it cannot show that approval."),
     "Terminal explorer and local browser companion":
-        ("The browser is read-only and several planned TUI views and fallbacks remain work.",),
+        ("The browser is read-only; automated coverage uses a real loopback HTTP server but no browser rendering engine, and the single-threaded server serialises requests.",
+         "Compact, ASCII, colour, configurable-key, and editing safeguards cover the static explorer; graph and source-view keys stay fixed, and the runtime/process dashboards keep their own layouts and keys."),
 }
 
 
@@ -179,6 +220,8 @@ def capability_report(*, project: str | None = None, scan_id: str | None = None,
             "details": item["details"],
             "limitations": list(LIMITATIONS.get(item["feature"], ())),
             "scope": scope,
+            "tests": list(CAPABILITY_TESTS.get(item["feature"], ())),
+            "verified_on": VERIFIED_PYTHON if status == "Full" else None,
             "evidence_record": record(
                 "unknown", "tested capability and documented limitation",
                 source={"project": project, "scan_id": scan_id} if project or scan_id else None,

@@ -10,12 +10,13 @@ import sys
 from datetime import UTC, datetime
 from collections import Counter, defaultdict, deque
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .advanced import MAX_REPORTED_LOOP_DEPTH, advanced_facts, local_metrics, node_at
 from .capabilities import capability_report
 from .engine import Engine, ThreadError
 from .runtime.concurrency import build_timeline
+from .runtime.preflight import summarize as summarize_preflight
 from .config import load as load_config, merge as merge_config
 from .evidence import attach, classify, record
 from .flowgraph import ControlFlow, def_use, definition_at, slice_records
@@ -67,19 +68,6 @@ def _library_description(name: str) -> str:
     except (PackageNotFoundError, ValueError):
         pass
     return "No local description is available; inspect its import sites and declared dependency metadata."
-
-
-def _entrypoint_summary(entry: dict[str, Any]) -> str:
-    kind = entry["kind"]
-    if kind == "route":
-        return "Handles a user-facing HTTP request."
-    if kind in {"console", "cli", "argparse"}:
-        return "Starts from a command a person can run in a terminal."
-    if kind in {"script", "module"}:
-        return "Starts when this Python script or module is run."
-    if kind == "worker":
-        return "Runs as background work, usually after another part of the program schedules it."
-    return "A detected place where this project can start work."
 
 
 def _confidence_explanation(confidence: str) -> str:
@@ -158,19 +146,6 @@ def _coverage_structure(path: Path) -> tuple[set[int], list[dict[str, Any]]]:
                              "end_line": getattr(node.orelse[-1], "end_lineno", node.orelse[-1].lineno)})
         branches.append({"line": node.lineno, "kind": type(node).__name__.lower(), "outcomes": outcomes})
     return lines, branches
-
-
-def _walk_explanation(relation: dict[str, Any], target: dict[str, Any] | None) -> str:
-    name = relation.get("target_name") or "the next step"
-    if relation["kind"] == "direct_call":
-        if target and target.get("purpose"):
-            return f"Calls {name}. {target['purpose']}"
-        return f"Calls {name} directly after the previous step."
-    if relation["kind"] == "candidate_call":
-        return f"May call {name}, but ThreadTrace cannot resolve the target uniquely."
-    if relation["kind"] == "import":
-        return f"Loads code from {name} so this step can use it."
-    return f"Moves to {name} through a {relation['kind'].replace('_', ' ')} relationship."
 
 
 def _friendly_finding(row: dict[str, Any]) -> tuple[str, str]:
@@ -712,90 +687,83 @@ class QueryService:
             return overview
         raise ThreadError(f"No entry point or symbol matches '{target}'.")
 
-    def ai_explain(self, project: str, target: str, model: str | None = None,
-                   endpoint: str | None = None) -> dict[str, Any]:
-        """Ask the explicitly selected local Ollama service to narrate stored evidence."""
-        from .ai import AIError, explain as explain_with_ai
-
-        scan = self._scan(project)
-        static = self.explain(project, target)
-        evidence = {
-            "target": static,
+    def _ai_facts(self, project: str, target: str) -> dict[str, Any]:
+        facts = {
+            "target": self.explain(project, target),
             "project_overview": self.overview(project),
             "libraries": self.libraries(project),
         }
+        symbols = self.symbol(project, target)
+        if symbols:
+            facts["target_source"] = [
+                {key: row.get(key) for key in ("qualified_name", "relative_path", "line_start", "line_end")}
+                for row in symbols[:5]
+            ]
+        return facts
+
+    def ai_preview(self, project: str, target: str, ai_settings: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Return the exact bounded payload without contacting a provider."""
+        from .ai import AIError, build_request, settings_from
+
         try:
-            narrative = explain_with_ai(evidence, model, endpoint)
+            request = build_request(self._ai_facts(project, target), settings_from(ai_settings))
         except AIError as exc:
             raise ThreadError(str(exc)) from exc
-        report_kind = "ai_explain:" + hashlib.sha256(f"{target}|ollama|{model or ''}".encode()).hexdigest()[:16]
-        content = {"target": target, "provider": "ollama", "model": model, "narrative": narrative,
-                   "notice": "AI-assisted interpretation. Verify every claim against the included source evidence.",
-                   "evidence_record": record(
-                       "heuristically predicted", "local AI narration of stored evidence", source={"target": target},
-                       run={"model": model, "provider": "ollama"},
-                       limitations=("The narrative is generated text; verify every claim against the stored evidence.",),
-                   )}
+        return {key: request[key] for key in ("digest", "remote", "payload", "prompt", "manifest")}
+
+    def ai_explain(self, project: str, target: str, ai_settings: dict[str, Any] | None = None,
+                   approve: Callable[[dict[str, Any]], bool] | None = None) -> dict[str, Any]:
+        """Ask an approved provider to interpret stored evidence and persist the exchange."""
+        from .ai import AIError, explain as explain_with_ai, settings_from
+
+        scan = self._scan(project)
+        try:
+            result = explain_with_ai(self._ai_facts(project, target), settings_from(ai_settings), approve)
+        except AIError as exc:
+            raise ThreadError(str(exc)) from exc
+        created_at = datetime.now(UTC).isoformat()
+        report_kind = "ai_explain:" + hashlib.sha256(
+            f"{scan['scan_id']}|{target}|{result['request']['digest']}|{created_at}".encode()
+        ).hexdigest()[:16]
+        content = {
+            "target": target, "report_kind": report_kind,
+            "provider": result["provider"], "model": result["model"], "settings": result["settings"],
+            "request": result["request"], "response": result["response"], "narrative": result["narrative"],
+            "created_at": created_at, "notice": result["notice"],
+            "evidence_record": record(
+                "heuristically predicted", "AI interpretation of stored evidence", source={"target": target},
+                run={"model": result["model"], "provider": result["provider"]},
+                limitations=("Generated interpretation. Every claim must be checked against the stored evidence.",),
+            ),
+        }
         self.store.execute(
-            "INSERT OR REPLACE INTO reports VALUES(?,?,?,?,?)",
-            (hashlib.sha256(f"{scan['scan_id']}|{report_kind}".encode()).hexdigest(), scan["scan_id"], report_kind,
-             self.store.json(content), datetime.now(UTC).isoformat()),
+            "INSERT INTO reports VALUES(?,?,?,?,?)",
+            (hashlib.sha256(f"{scan['scan_id']}|{report_kind}".encode()).hexdigest(), scan["scan_id"],
+             report_kind, self.store.json(content), created_at),
         )
         self.store.connection.commit()
         return content
 
-    def guide(self, project: str) -> dict[str, Any]:
-        """Return a beginner-facing starting point without hiding evidence."""
-        overview = self.overview(project)
-        order = {"route": 0, "console": 1, "cli": 2, "argparse": 3, "script": 4, "module": 5, "worker": 6, "test": 9}
-        starting_points = [item for item in self.entrypoints(project) if item["kind"] != "test"]
-        starting_points.sort(key=lambda item: (order.get(item["kind"], 8), item["name"]))
-        for item in starting_points:
-            item["plain_summary"] = _entrypoint_summary(item)
-        components = [item for item in overview["components"] if item["role"] != "test"]
-        result = {
-            "purpose": overview["purpose"],
-            "starting_points": starting_points,
-            "main_parts": components,
-            "needs_attention": self.findings(project),
-            "next_step": starting_points[0]["name"] if starting_points else None,
-        }
-        result["evidence_record"] = record("heuristically predicted", "static starting-point guidance",
-                                           source=overview["evidence_record"]["source"],
-                                           limitations=("Guidance is derived from stored static evidence.",))
-        return result
-
-    def walk(self, project: str, entry: str, depth: int = 8, confidence: str = "possible") -> dict[str, Any]:
-        """Explain one supported entry-point path in plain, evidence-backed terms."""
-        path = self.path(project, entry, depth, confidence)
-        steps: list[dict[str, Any]] = []
-        for ordinal, relation in enumerate(path["steps"], 1):
-            target = self.store.one(
-                """SELECT s.qualified_name,s.kind,s.purpose,s.line_start,s.line_end,f.relative_path,f.module_name
-                   FROM symbols s JOIN files f ON f.file_id=s.file_id WHERE s.symbol_id=?""",
-                (relation["target_symbol_id"],),
-            )
-            step = {
-                "ordinal": ordinal,
-                "kind": relation["kind"],
-                "confidence": relation["confidence"],
-                "source": relation.get("source_name") or "starting point",
-                "target": relation.get("target_name") or "unknown target",
-                "explanation": _walk_explanation(relation, target),
-                "confidence_explanation": _confidence_explanation(relation["confidence"]),
-                "evidence": relation["evidence"],
-            }
-            if target:
-                step.update(target)
-            attach(step, "entry-point path step", source=_source(step))
-            steps.append(step)
-        return {
-            "entry_point": path["entry_point"],
-            "depth": path["depth"],
-            "steps": steps,
-            "resources": path["resources"],
-            "stopped_at": path.get("stopped_at"),
-        }
+    def ai_history(self, project: str) -> list[dict[str, Any]]:
+        """List persisted AI exchanges so they can be reviewed or deleted."""
+        scan = self._scan(project)
+        rows = self.store.rows(
+            "SELECT report_kind,content_json,generated_at FROM reports "
+            "WHERE scan_id=? AND report_kind LIKE 'ai_explain:%' ORDER BY generated_at DESC",
+            (scan["scan_id"],),
+        )
+        history = []
+        for row in rows:
+            content = json.loads(row["content_json"])
+            history.append({
+                "report_kind": row["report_kind"], "target": content.get("target"),
+                "provider": content.get("provider"), "model": content.get("model"),
+                "created_at": row["generated_at"],
+                "digest": (content.get("request") or {}).get("digest"),
+                "claims": len((content.get("response") or {}).get("claims") or []),
+                "delete_with": f"threadtrace delete report {project} {row['report_kind']} --yes",
+            })
+        return history
 
     def file_map(self, project: str, target: str | None = None, depth: int = 4) -> dict[str, Any]:
         """Show the files linked to a selected symbol, entry point, or module."""
@@ -1095,14 +1063,30 @@ class QueryService:
         result.update({"trace_id": trace_id, "evidence_class": "observed at runtime"})
         return result
 
+    def preflight(self, project: str) -> dict[str, Any]:
+        """Summarise static resources before an explicitly requested run."""
+        scan = self._scan(project)
+        rows = self.store.rows(
+            "SELECT kind,name,operation,module_name,confidence FROM resources WHERE scan_id=?",
+            (scan["scan_id"],),
+        )
+        result = summarize_preflight(rows)
+        result["scan_id"] = scan["scan_id"]
+        return result
+
     def trace_resources(self, project: str, trace_id: str) -> dict[str, Any]:
         """Return the observed resource and serialisation timeline for a trace."""
-        events = [
-            event for event in self.trace_events(project, trace_id)
-            if event["event_kind"] == "resource"
-        ]
+        all_events = self.trace_events(project, trace_id)
+        events = [event for event in all_events if event["event_kind"] == "resource"]
+        adapter_support: list[dict[str, Any]] = []
+        for event in all_events:
+            details = event["evidence"]["details"]
+            if event["event_kind"] == "process" and details.get("adapters"):
+                adapter_support = details["adapters"]
         counts: Counter[str] = Counter()
         statuses: Counter[str] = Counter()
+        adapter_counts: Counter[str] = Counter()
+        adapter_durations: dict[str, float] = defaultdict(float)
         failures = 0
         for event in events:
             details = event["evidence"]["details"]
@@ -1110,6 +1094,10 @@ class QueryService:
             status = details.get("status", "unknown")
             statuses[status] += 1
             failures += int(status == "failed")
+            adapter = (details.get("details") or {}).get("adapter") or details.get("adapter")
+            if adapter:
+                adapter_counts[adapter] += 1
+                adapter_durations[adapter] += float(details.get("duration_seconds") or 0)
         result = {
             "trace_id": trace_id,
             "evidence_class": "observed at runtime",
@@ -1117,11 +1105,19 @@ class QueryService:
             "failure_count": failures,
             "by_status": dict(sorted(statuses.items())),
             "by_resource": dict(sorted(counts.items())),
+            "adapter_support": adapter_support,
+            "adapter_performance": {
+                name: {"events": count,
+                       "observed_seconds": round(adapter_durations[name], 6),
+                       "mean_seconds": round(adapter_durations[name] / count, 6)}
+                for name, count in sorted(adapter_counts.items())
+            },
             "timeline": events,
         }
         result["evidence_record"] = record(
             "observed at runtime", "persisted resource events from one trace", run=trace_id,
-            limitations=("Native drivers, packet inspection, and operations without a project Python origin are unavailable.",),
+            limitations=("Native drivers, packet inspection, TLS decryption, and operations without a project Python origin are unavailable.",
+                         "Adapter timing is observed operation duration, not isolated wrapper overhead."),
         )
         return result
 

@@ -775,6 +775,8 @@ adapter list.
 **Done when:** Every adapter claim has an acceptance fixture proving both the
 captured evidence and preservation of target stream/cursor behaviour.
 
+**Implementation status:** Complete (2026-11-25).
+
 ### TT-022 — Make Hybrid precedence and replay deterministic
 
 **Goal:** Enforce documented rule precedence, conflicts, interpreter selection,
@@ -806,6 +808,8 @@ and reproducible controls.
 conflict is diagnosed before execution, and omitted data never produces false
 equality.
 
+**Implementation status:** Complete (2026-11-25).
+
 ### TT-023 — Complete Hybrid adapters and exploration budgets
 
 **Goal:** Finish controlled dependency replay and keep automated exploration
@@ -836,9 +840,13 @@ bounded and reproducible.
 **Done when:** Adapter replay cannot leak through unexpectedly and exploration
 always stops at visible global limits with reproducible retained inputs.
 
+**Implementation status:** Complete (2026-11-25).
+
 ## Phase 5 — interfaces, AI, and portability
 
 ### TT-024 — Build the documented browser graph interface
+
+**Implementation status:** Complete (2026-11-25).
 
 **Goal:** Deliver the required read-only local graph explorer on top of the
 shared analysis model.
@@ -870,6 +878,8 @@ and exported from a real browser request without executing the target.
 
 ### TT-025 — Complete TUI fallbacks, editing, and accessibility
 
+**Implementation status:** Complete (2026-11-25).
+
 **Goal:** Make terminal operation reliable across terminal sizes and display
 capabilities while making source edits safe.
 
@@ -900,6 +910,8 @@ capabilities while making source edits safe.
 discoverable route, and invalid/conflicting source cannot be silently saved.
 
 ### TT-026 — Implement safe provider-independent AI
+
+**Implementation status:** Complete (2026-11-25).
 
 **Goal:** Support optional Ollama and OpenAI-compatible providers without
 weakening privacy or evidence rules.
@@ -934,6 +946,8 @@ and malformed or invented structured references are rejected.
 
 ### TT-027 — Complete exports, investigations, and Python API
 
+**Implementation status:** Complete (2026-11-25).
+
 **Goal:** Produce portable, versioned artifacts and resumable investigation
 workspaces.
 
@@ -967,6 +981,8 @@ its source revision and limitations, and round-trips without losing references.
 ## Phase 6 — verification, packaging, and release
 
 ### TT-028 — Build compatibility, accuracy, and performance gates
+
+**Implementation status:** Complete (2026-11-25).
 
 **Goal:** Make every support claim traceable to deterministic automated evidence.
 

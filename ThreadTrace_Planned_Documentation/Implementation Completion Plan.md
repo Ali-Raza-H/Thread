@@ -6,6 +6,12 @@
 > testable tasks. [[v1.0 Product Decisions]] remains the product authority. If
 > this plan conflicts with that document, the product decision wins.
 
+> [!warning]
+> A task marked `Implementation status: Complete` is historical evidence that
+> the original task was addressed. It is not, by itself, proof that the whole
+> product is 100% complete. The completion categories below are the governing
+> status model for the remaining work.
+
 ## How to use this plan
 
 Work on one task ID at a time. Do not combine unrelated tasks merely because
@@ -30,6 +36,78 @@ For every task:
    with `--format json` when it has CLI output.
 8. Inspect `git diff` and confirm that no unrelated user changes were altered.
 
+## Completion categories
+
+Every task has six independent completion gates. A task is not `Complete`
+until all six gates pass. This prevents an implemented code path from being
+mistaken for a fully supported, documented, and releasable capability.
+
+| Category | Meaning | Required evidence |
+| --- | --- | --- |
+| C0 — Scoped | The requirement and boundary are agreed. | Product decision, affected capability row, explicit exclusions, and dependency owner. |
+| C1 — Implemented | The production behavior exists. | Source implementation, migrations/configuration where needed, and no placeholder path for the claimed boundary. |
+| C2 — Behavior verified | The behavior works on deterministic fixtures. | Focused regression tests, negative/error tests, JSON-output checks, and the full suite on the declared interpreter/platform. |
+| C3 — Evidence bounded | The result is honest about certainty and limits. | Evidence class, provenance, truncation, stale state, unsupported cases, privacy behavior, and capability status are tested and visible. |
+| C4 — Documentation reconciled | Every documentation surface says the same thing. | README, user manual, changelog, capability audit, feature/design note, product decisions, glossary/map, and CLI help are checked. |
+| C5 — Release verified | The capability survives packaging and release checks. | Clean checkout, documented installation, migration/export compatibility, package contents, offline suite, performance/safety gates, and reproducible release evidence. |
+| C6 — Complete | C0 through C5 all pass for the declared support boundary. | A dated completion record links the implementation, tests, evidence, documentation diff, and release run. |
+| D — Deferred/unsupported | Intentionally outside the current support boundary. | Product authority explicitly defers it; code reports `Partial` or `Unsupported`; docs name the boundary; no `Full` claim exists. |
+
+### Percentage rule
+
+The plan reports two percentages separately:
+
+1. **Task completion:** `C6 tasks / all in-scope tasks`.
+2. **Capability completion:** `Full capabilities / all capability rows`.
+
+`Partial` is not counted as `Full`. A capability may have substantial working
+code and still remain `Partial` when an accepted limitation, unverified
+interpreter/platform, or missing boundary test remains. Deferred/unsupported
+capabilities are excluded from the denominator only when the product authority
+explicitly marks them as non-tasks; otherwise they remain open work.
+
+### Current audit baseline
+
+The repository audit on 2026-11-26 is the starting point for Phase 7, not a
+100% result:
+
+- The full suite passes on the verified CPython 3.11/Linux reference boundary:
+  `129 passed, 865 subtests passed`; the equivalent unittest discovery run also
+  passes.
+- The capability audit contains 20 rows: 4 `Full`, 15 `Partial`, and 1
+  `Unsupported`. That is 20% `Full` capability coverage under the percentage
+  rule above; it is not a claim that only 20% of the code works.
+- The baseline has one known missing Obsidian wiki link, `[[Run]]`, in
+  `ThreadTrace.md`.
+- The baseline has a product-scope contradiction for Windows Host/Listener:
+  the product decision requires a Windows loopback alternative while the
+  current capability/manual boundary reports that support as unsupported.
+- The baseline does not prove every supported interpreter, operating system,
+  real terminal rendering path, or browser rendering path. Those boundaries
+  remain open until TT-031, TT-033, TT-034, and TT-035 provide evidence.
+
+Do not replace these facts with a percentage derived from task labels. Update
+this snapshot only after rerunning the evidence and release gates in TT-036.
+
+### Required completion record
+
+Each task section must contain these fields before its status can be changed to
+`C6 — Complete`:
+
+```text
+Completion category: C0/C1/C2/C3/C4/C5/C6/D
+Verified boundary: interpreter, platform, dependency versions, and target context
+Implementation evidence: source files and schema/configuration changes
+Behavior evidence: focused tests, negative tests, and full-suite result
+Documentation evidence: exact notes/files updated or checked
+Release evidence: clean-install/package/migration result, when applicable
+Open limits: remaining Partial/Unsupported behavior
+```
+
+The completion category must move backwards if a later audit invalidates a
+claim. Do not leave `Complete` on a task whose capability row has become
+inaccurate.
+
 ## Ranking system
 
 Complexity and size are separate:
@@ -49,38 +127,44 @@ The size labels are relative to this repository. They are not time estimates.
 The table is ordered by dependency and risk, not by convenience. Complete P0
 correctness/privacy work before expanding the feature surface.
 
-| Order | ID | Task | Priority | Complexity | Size | Main dependency |
-| ---: | --- | --- | --- | ---: | --- | --- |
-| 1 | TT-001 | Repair browser database threading | P0 | 2 | S | None |
-| 2 | TT-002 | Correct Hybrid baseline comparison | P0 | 3 | S | None |
-| 3 | TT-003 | Report the terminating exception | P0 | 3 | S | None |
-| 4 | TT-004 | Make resource status and redaction truthful | P0 | 3 | M | None |
-| 5 | TT-005 | Stop false confirmed call resolution | P0 | 4 | M | None |
-| 6 | TT-006 | Honour launch interpreters and environments | P0 | 3 | M | None |
-| 7 | TT-007 | Make experiment diffs and deletion complete | P0 | 3 | M | None |
-| 8 | TT-008 | Make CLI formats and failures honest | P1 | 2 | S | None |
-| 9 | TT-009 | Bound and clean up Host/Listener sessions | P0 | 4 | L | TT-004 |
-| 10 | TT-010 | Complete evidence and capability migration | P0 | 4 | L | TT-005 |
-| 11 | TT-011 | Expand configuration and persistence safety | P1 | 4 | L | TT-010 |
-| 12 | TT-012 | Build the complete source-discovery model | P1 | 5 | XL | TT-011 |
-| 13 | TT-013 | Build Python-aware import and symbol resolution | P1 | 5 | XL | TT-012 |
-| 14 | TT-014 | Complete metadata recognition and staleness | P1 | 3 | M | TT-011, TT-012 |
-| 15 | TT-015 | Add verified entry-point/framework analysers | P1 | 5 | XL | TT-013 |
-| 16 | TT-016 | Correct impact, data flow, slicing, and CFG | P1 | 5 | XL | TT-013 |
-| 17 | TT-017 | Add structural complexity, resources, and advanced Python facts | P2 | 5 | XL | TT-013, TT-016 |
-| 18 | TT-018 | Expand runtime instrumentation and event schema | P1 | 5 | XL | TT-010, TT-011 |
-| 19 | TT-019 | Add identity-aware values and debugger controls | P1 | 5 | XL | TT-018 |
-| 20 | TT-020 | Add process, thread, task, and wait correlation | P1 | 5 | XL | TT-018, TT-019 |
-| 21 | TT-021 | Complete runtime resource adapters and preflight | P1 | 5 | XL | TT-004, TT-018 |
-| 22 | TT-022 | Make Hybrid precedence and replay deterministic | P1 | 4 | L | TT-002, TT-006, TT-007 |
-| 23 | TT-023 | Complete Hybrid adapters and exploration budgets | P2 | 4 | L | TT-021, TT-022 |
-| 24 | TT-024 | Build the documented browser graph interface | P1 | 5 | XL | TT-001, TT-010, TT-013, TT-016, TT-018 |
-| 25 | TT-025 | Complete TUI fallbacks, editing, and accessibility | P1 | 4 | L | TT-010, TT-016, TT-018 |
-| 26 | TT-026 | Implement safe provider-independent AI | P1 | 5 | L | TT-010, TT-011 |
-| 27 | TT-027 | Complete exports, investigations, and Python API | P2 | 4 | L | TT-010, TT-011, TT-024 |
-| 28 | TT-028 | Build compatibility, accuracy, and performance gates | P0 | 5 | XL | All feature tasks |
-| 29 | TT-029 | Reconcile packaging and all documentation | P1 | 2 | M | Implemented tasks |
-| 30 | TT-030 | Run the v1 release-capability gate | P0 | 4 | L | TT-001 through TT-029 |
+| Order | ID | Task | Priority | Complexity | Size | Main dependency | Current category |
+| ---: | --- | --- | --- | ---: | --- | --- | --- |
+| 1 | TT-001 | Repair browser database threading | P0 | 2 | S | None | C6 — Complete on CPython 3.11/Linux |
+| 2 | TT-002 | Correct Hybrid baseline comparison | P0 | 3 | S | None | C6 — Complete on CPython 3.11/Linux |
+| 3 | TT-003 | Report the terminating exception | P0 | 3 | S | None | C6 — Complete on CPython 3.11/Linux |
+| 4 | TT-004 | Make resource status and redaction truthful | P0 | 3 | M | None | C6 — Complete on CPython 3.11/Linux |
+| 5 | TT-005 | Stop false confirmed call resolution | P0 | 4 | M | None | C6 — Complete on CPython 3.11/Linux |
+| 6 | TT-006 | Honour launch interpreters and environments | P0 | 3 | M | None | C6 — Complete on CPython 3.11/Linux |
+| 7 | TT-007 | Make experiment diffs and deletion complete | P0 | 3 | M | None | C6 — Complete on CPython 3.11/Linux |
+| 8 | TT-008 | Make CLI formats and failures honest | P1 | 2 | S | None | C6 — Complete on CPython 3.11/Linux |
+| 9 | TT-009 | Bound and clean up Host/Listener sessions | P0 | 4 | L | TT-004 | C5 — Unix verified; Windows scope unresolved |
+| 10 | TT-010 | Complete evidence and capability migration | P0 | 4 | L | TT-005 | C6 — Complete on CPython 3.11/Linux |
+| 11 | TT-011 | Expand configuration and persistence safety | P1 | 4 | L | TT-010 | C6 — Complete on CPython 3.11/Linux |
+| 12 | TT-012 | Build the complete source-discovery model | P1 | 5 | XL | TT-011 | C6 — Complete on CPython 3.11/Linux |
+| 13 | TT-013 | Build Python-aware import and symbol resolution | P1 | 5 | XL | TT-012 | C6 — Complete on CPython 3.11/Linux |
+| 14 | TT-014 | Complete metadata recognition and staleness | P1 | 3 | M | TT-011, TT-012 | C6 — Complete on CPython 3.11/Linux |
+| 15 | TT-015 | Add verified entry-point/framework analysers | P1 | 5 | XL | TT-013 | C6 — Complete on CPython 3.11/Linux |
+| 16 | TT-016 | Correct impact, data flow, slicing, and CFG | P1 | 5 | XL | TT-013 | C6 — Complete on CPython 3.11/Linux |
+| 17 | TT-017 | Add structural complexity, resources, and advanced Python facts | P2 | 5 | XL | TT-013, TT-016 | C6 — Complete on CPython 3.11/Linux |
+| 18 | TT-018 | Expand runtime instrumentation and event schema | P1 | 5 | XL | TT-010, TT-011 | C6 — Complete on CPython 3.11/Linux |
+| 19 | TT-019 | Add identity-aware values and debugger controls | P1 | 5 | XL | TT-018 | C6 — Complete on CPython 3.11/Linux |
+| 20 | TT-020 | Add process, thread, task, and wait correlation | P1 | 5 | XL | TT-018, TT-019 | C6 — Complete on CPython 3.11/Linux |
+| 21 | TT-021 | Complete runtime resource adapters and preflight | P1 | 5 | XL | TT-004, TT-018 | C6 — Complete on CPython 3.11/Linux |
+| 22 | TT-022 | Make Hybrid precedence and replay deterministic | P1 | 4 | L | TT-002, TT-006, TT-007 | C6 — Complete on CPython 3.11/Linux |
+| 23 | TT-023 | Complete Hybrid adapters and exploration budgets | P2 | 4 | L | TT-021, TT-022 | C6 — Complete on CPython 3.11/Linux |
+| 24 | TT-024 | Build the documented browser graph interface | P1 | 5 | XL | TT-001, TT-010, TT-013, TT-016, TT-018 | C6 — Complete on CPython 3.11/Linux |
+| 25 | TT-025 | Complete TUI fallbacks, editing, and accessibility | P1 | 4 | L | TT-010, TT-016, TT-018 | C6 — Complete on CPython 3.11/Linux |
+| 26 | TT-026 | Implement safe provider-independent AI | P1 | 5 | L | TT-010, TT-011 | C6 — Complete on CPython 3.11/Linux |
+| 27 | TT-027 | Complete exports, investigations, and Python API | P2 | 4 | L | TT-010, TT-011, TT-024 | C6 — Complete on CPython 3.11/Linux |
+| 28 | TT-028 | Build compatibility, accuracy, and performance gates | P0 | 5 | XL | All feature tasks | C6 — Complete on CPython 3.11/Linux |
+| 29 | TT-029 | Reconcile packaging and all documentation | P1 | 2 | M | Implemented tasks | C4 — Vault and scope discrepancies remain |
+| 30 | TT-030 | Run the v1 release-capability gate | P0 | 4 | L | TT-001 through TT-029 | C5 — Reference release verified |
+| 31 | TT-031 | Resolve the Windows Host/Listener product boundary | P0 | 5 | L | TT-009, TT-030 | C0 — Scoped |
+| 32 | TT-032 | Repair vault integrity and documentation navigation | P1 | 2 | S | TT-029 | C0 — Scoped |
+| 33 | TT-033 | Replace capability labels with measured per-boundary evidence | P0 | 5 | XL | TT-028, TT-030 | C0 — Scoped |
+| 34 | TT-034 | Expand interpreter and platform verification | P0 | 5 | XL | TT-028, TT-031 | C0 — Scoped |
+| 35 | TT-035 | Complete interactive UI and accessibility verification | P1 | 4 | L | TT-024, TT-025, TT-030 | C0 — Scoped |
+| 36 | TT-036 | Re-run the 100% release gate and publish the score | P0 | 4 | L | TT-031 through TT-035 | C0 — Scoped |
 
 ## Phase 1 — correctness, privacy, and truthful output
 
@@ -1082,6 +1166,230 @@ help, and code report the same name, version, behaviour, limits, and licence.
 supported-interpreter fixtures, and all release artifacts reproduce the same
 verified capability report.
 
+## Documentation coverage contract
+
+Documentation is part of the implementation. A task that changes behavior,
+limits, data shape, safety, installation, or capability status must update and
+verify every applicable surface below in the same change.
+
+| Documentation surface | What it controls |
+| --- | --- |
+| `Design/v1.0 Product Decisions.md` | Accepted scope, platform/interpreter policy, safety boundary, and decisions that override older notes. |
+| `ThreadTrace.md` | Vault entry point, documentation map, terminology, evidence vocabulary, and links. |
+| `Features/*.md` | User-visible behavior for Static, Dynamic, Hybrid, and Shared Systems. |
+| `Design/*.md` | Architecture, persistence, browser, TUI, compatibility, safety, and design constraints. |
+| `Reference/Capability Model.md` | Meaning of `Full`, `Partial`, and `Unsupported`. |
+| `Reference/Capability Audit.md` | Current capability rows, exact boundaries, tests, interpreter/platform, and release evidence. |
+| `Testing and Acceptance Criteria.md` | Required acceptance categories and release quality expectations. |
+| `Reference/Outstanding Decisions.md` | Decisions still open, explicitly deferred, or reconciled. |
+| `Reference/Glossary.md` | Names and meanings of product terms used by code and documentation. |
+| `Implementation Completion Plan.md` | Task state, dependencies, completion evidence, and final gate. |
+| `README.md` | Accurate public quick start, scope, safety, and supported workflows. |
+| `USER_MANUAL.md` | Complete command behavior, options, outputs, confirmations, storage, limits, and troubleshooting. |
+| `CHANGELOG.md` | Dated user-visible changes and verified release evidence. |
+| `pyproject.toml`, `.dev.json`, `MANIFEST.in`, `LICENSE` | Installable identity, dependencies, package contents, development commands, and licensing. |
+| Obsidian integrity | Every wiki link resolves, archived notes are labelled historical, and no stale command or product name remains. |
+
+### Task-to-documentation matrix
+
+The following matrix is mandatory. A task cannot reach C4 or C6 until its
+listed surfaces have been checked, even when the code and tests already pass.
+
+| Task | Required documentation surfaces |
+| --- | --- |
+| TT-001 | Browser Interface; System Architecture; Safety and Performance; Capability Audit; USER_MANUAL browser section; README browser section. |
+| TT-002 | Hybrid Analysis; v1.0 Product Decisions — Hybrid experiments; Capability Audit; USER_MANUAL experiments and comparison sections; CHANGELOG. |
+| TT-003 | Dynamic Analysis; Safety and Performance; Capability Audit; USER_MANUAL failure/troubleshooting sections; README runtime summary; CHANGELOG. |
+| TT-004 | Dynamic Analysis resources; Safety and Performance; v1.0 Product Decisions — Runtime resource observation; Capability Audit; USER_MANUAL redaction/resource sections; CHANGELOG. |
+| TT-005 | Static Analysis; System Architecture; Capability Model; Capability Audit; USER_MANUAL resolution/evidence sections; README evidence language. |
+| TT-006 | Dynamic Analysis execution management; v1.0 Product Decisions — installation/configuration and dynamic execution; Capability Audit; USER_MANUAL profiles/runtime sections; README profiles example. |
+| TT-007 | Hybrid Analysis; Data Model and Persistence; Capability Audit; USER_MANUAL experiments/deletion/exports; CHANGELOG. |
+| TT-008 | Shared Systems; Capability Audit; USER_MANUAL command/format/error sections; README quick start; CLI help; tests/test_packaging.py expectations. |
+| TT-009 | Dynamic Analysis execution management/concurrency; Browser/TUI and Safety designs; v1.0 Product Decisions — Host/Listener; Capability Audit; USER_MANUAL Host/Listener and unsupported-boundaries sections; README live-observation section. |
+| TT-010 | System Architecture evidence; Capability Model; Capability Audit; USER_MANUAL evidence section; README evidence vocabulary; migration notes in CHANGELOG. |
+| TT-011 | Data Model and Persistence; Safety and Performance; v1.0 Product Decisions — configuration/persistence; Capability Audit; USER_MANUAL storage/configuration/deletion sections; README configuration summary. |
+| TT-012 | Static Analysis; Python Compatibility; Safety and Performance; Capability Audit; USER_MANUAL source-discovery section; README discovery summary. |
+| TT-013 | Static Analysis; System Architecture; Capability Model; Capability Audit; USER_MANUAL resolution/references; README binding-resolution summary. |
+| TT-014 | Static Analysis; Data Model and Persistence; Capability Audit; USER_MANUAL metadata/staleness; README metadata summary. |
+| TT-015 | Static Analysis; Feature Research; Capability Audit; USER_MANUAL API/entry-point/library sections; README framework summary. |
+| TT-016 | Static Analysis; System Architecture; Capability Audit; USER_MANUAL paths/impact/data-flow/slice/CFG; README graph/relationship summary. |
+| TT-017 | Static Analysis; Safety and Performance; Capability Audit; USER_MANUAL complexity/advanced/resource sections; README static-analysis summary. |
+| TT-018 | Dynamic Analysis; Instrumentation Research; Python Compatibility; Capability Audit; USER_MANUAL event/profile/coverage sections; README runtime summary. |
+| TT-019 | Dynamic Analysis debugging/variables; Safety and Performance; Capability Audit; USER_MANUAL dashboard/debugger sections; README runtime dashboard. |
+| TT-020 | Dynamic Analysis concurrency; v1.0 Product Decisions — processes/concurrency; Capability Audit; USER_MANUAL concurrency/process sections; README runtime/process sections. |
+| TT-021 | Dynamic Analysis resources; Instrumentation Research; Safety and Performance; Capability Audit; USER_MANUAL adapter/preflight/redaction sections; CHANGELOG. |
+| TT-022 | Hybrid Analysis; v1.0 Product Decisions — Hybrid experiments; Capability Audit; USER_MANUAL preflight/replay/precedence; README Hybrid summary. |
+| TT-023 | Hybrid Analysis; Capability Audit; USER_MANUAL adapters/exploration/budgets; README Hybrid example; CHANGELOG. |
+| TT-024 | Browser Interface; System Architecture; Capability Audit; USER_MANUAL browser/graph/export sections; README browser section; CLI help. |
+| TT-025 | TUI Design; Safety and Performance; Capability Audit; USER_MANUAL TUI/editing/accessibility; README TUI section. |
+| TT-026 | Shared Systems AI; v1.0 Product Decisions — AI behavior; Capability Audit; USER_MANUAL AI/security/configuration; README AI section; CHANGELOG. |
+| TT-027 | Shared Systems; Data Model and Persistence; Capability Audit; USER_MANUAL investigations/exports/API; README exports/API; CHANGELOG. |
+| TT-028 | Testing and Acceptance Criteria; Python Compatibility; Capability Model; Capability Audit; pyproject.toml; tests/test_evidence.py mapping; CHANGELOG evidence. |
+| TT-029 | Entire vault; README; USER_MANUAL; CHANGELOG; pyproject.toml; `.dev.json`; MANIFEST.in; LICENSE; CLI help; Obsidian link integrity. |
+| TT-030 | Capability Audit; Capability Model; v1.0 Product Decisions; Testing and Acceptance Criteria; CHANGELOG; package artifacts; release command output. |
+
+## Phase 7 — close the remaining gaps to 100%
+
+The original thirty tasks establish the verified CPython 3.11/Linux baseline.
+These follow-up tasks are required before claiming that every in-scope area is
+100% complete. They deliberately separate unresolved product scope from code
+that already works on the reference platform.
+
+### TT-031 — Resolve the Windows Host/Listener product boundary
+
+**Completion category:** C0 — Scoped.
+
+**Goal:** Make the product decision, implementation, capability status, and
+public documentation agree about Windows Host/Listener IPC.
+
+**Required decision:** Choose exactly one:
+
+1. Implement and test a current-user, loopback-only Windows transport with
+   session identity checks, one-listener ownership, bounded pages, takeover
+   expiry, cleanup, and transport errors; or
+2. Amend the product decision to defer Windows Host/Listener IPC and keep it
+   explicitly `Unsupported` for v1.
+
+**Implementation and test work:**
+
+- Add a platform-neutral transport interface so Unix sockets and the Windows
+  fallback share framing, paging, authentication, and error semantics.
+- Test malformed messages, wrong session IDs, oversized events, stale sessions,
+  listener takeover, host termination, permission failures, reconnection, and
+  process-group cleanup on every supported platform.
+- Do not mark the capability `Full` merely because the Unix implementation
+  passes.
+
+**Documentation work:** Update the product decision, Dynamic Analysis,
+Python Compatibility, Safety and Performance, Capability Audit, USER_MANUAL,
+README, CHANGELOG, and the unsupported-boundaries table together.
+
+**Done when:** One scope is stated consistently everywhere and the selected
+Windows boundary has passing evidence or is explicitly deferred.
+
+### TT-032 — Repair vault integrity and documentation navigation
+
+**Completion category:** C0 — Scoped.
+
+**Goal:** Make the Obsidian vault navigable and remove documentation-only drift.
+
+**Implementation/documentation work:**
+
+- Resolve the broken `[[Run]]` link in `ThreadTrace.md` by adding the missing
+  glossary/spec note or linking to the existing runtime terminology.
+- Run a wiki-link checker over every Markdown note, including links with
+  headings and aliases.
+- Check code paths, command names, version strings, product names, platform
+  claims, and archived-note references.
+- Remove generated artifact paths from “current files” lists when those files
+  are intentionally pruned from source distributions; describe the generated
+  artifact only where packaging requires it.
+- Keep archived proposals visibly historical and out of the active product
+  authority chain.
+
+**Done when:** Zero missing vault links remain, all active notes resolve to the
+same authority chain, and every stale generated/dead reference is either
+removed or explicitly labelled.
+
+### TT-033 — Replace capability labels with measured per-boundary evidence
+
+**Completion category:** C0 — Scoped.
+
+**Goal:** Make every capability row reach `Full` where the product promises
+complete behavior, or make its remaining boundary an explicit product decision.
+
+**Required work for every capability row:**
+
+- Name the exact interpreter, operating system, dependency versions, source
+  form, project shape, and execution mode tested.
+- Add positive, negative, malformed, truncated, stale, privacy, and unsupported
+  fixtures where the row describes those boundaries.
+- Record the test names in `src/threadtrace/test_evidence.py`.
+- Ensure `capabilities.py`, Capability Audit, Capability Model, USER_MANUAL,
+  README, and relevant feature/design notes use the same status and wording.
+- Do not count a broad integration test as proof for untested subfeatures.
+
+**Priority rows:** static framework controls and dynamic registration; source
+forms beyond ordinary files; third-party symbol traversal; dynamic dispatch;
+runtime instrumentation differences; native/process boundaries; runtime
+resource adapters; AI provider behavior; TUI/browser rendering and
+accessibility; cross-platform permissions and IPC.
+
+**Done when:** Every `Full` row has complete named boundary coverage, every
+`Partial` row has a deliberate product-approved limitation, and every
+`Unsupported` row is either implemented or listed as a non-task.
+
+### TT-034 — Expand interpreter and platform verification
+
+**Completion category:** C0 — Scoped.
+
+**Goal:** Stop treating the CPython 3.11/Linux reference run as universal
+  support.
+
+**Required work:**
+
+- Decide the supported v1 matrix from the product authority.
+- Run the complete suite on every supported CPython version and platform.
+- Test static-only behavior separately on unverified interpreters.
+- Test permissions, paths, process groups, terminal behavior, SQLite locking,
+  loopback browser access, Host/Listener transport, and packaging on each
+  target.
+- Keep classifiers and capability output limited to evidence-backed targets.
+
+**Done when:** The support matrix is published, reproducible, and identical
+across pyproject metadata, the manual, Capability Audit, and release artifacts.
+
+### TT-035 — Complete interactive UI and accessibility verification
+
+**Completion category:** C0 — Scoped.
+
+**Goal:** Turn the current logic-level TUI/browser confidence into verified
+interactive support.
+
+**Required work:**
+
+- Exercise the real TUI at normal, compact, resized, Unicode, ASCII, colour,
+  and no-colour settings.
+- Verify keyboard collision validation, command-palette discoverability,
+  source navigation, editing confirmation, hash checks, atomic writes, and
+  rescan selection preservation.
+- Exercise runtime, process, live listener, and browser interfaces separately;
+  do not infer their behavior from static TUI tests.
+- Add accessibility checks for text-only status cues, focus order, readable
+  errors, bounded content, and no-color operation.
+- Keep browser rendering claims separate from HTTP/API tests when no browser
+  engine is used.
+
+**Done when:** Each UI capability has a named interaction test or an explicit
+unsupported rendering boundary, and the manual describes the same boundary.
+
+### TT-036 — Re-run the 100% release gate and publish the score
+
+**Completion category:** C0 — Scoped.
+
+**Goal:** Produce one final, auditable completion result rather than relying on
+  plan labels.
+
+**Required work:**
+
+1. Start from a clean checkout with no virtual environment, caches, generated
+   metadata, private data, or uncommitted changes.
+2. Install only through the documented command.
+3. Run the full suite, `unittest discover`, safety subset, accuracy corpus,
+   migration/export compatibility, performance gates, and all deterministic
+   README/manual commands.
+4. Build and inspect sdist and wheel contents.
+5. Recalculate task completion from C6 rows and capability completion from
+   `Full` rows; publish both numbers separately.
+6. Record every remaining `Partial`, `Unsupported`, or D item with an owner,
+   reason, test, documentation boundary, and next decision.
+7. Update Capability Audit, CHANGELOG, README, USER_MANUAL, and this plan with
+   the same date, commit, interpreter/platform, and results.
+
+**Done when:** The score is reproducible from the repository, no task is C6
+without all six gates, no undocumented Full claim exists, and the release
+decision explicitly states what “100%” means.
+
 ## Explicit non-tasks for v1
 
 Do not expand the plan with these unless the product authority changes:
@@ -1101,21 +1409,22 @@ Do not expand the plan with these unless the product authority changes:
 From hardest to easiest:
 
 1. **Complexity 5:** TT-012, TT-013, TT-015 through TT-021, TT-024, TT-026,
-   TT-028.
+   TT-028, TT-031, TT-033, TT-034.
 2. **Complexity 4:** TT-005, TT-009 through TT-011, TT-022, TT-023, TT-025,
-   TT-027, TT-030.
+   TT-027, TT-030, TT-035, TT-036.
 3. **Complexity 3:** TT-002 through TT-004, TT-006, TT-007, TT-014.
-4. **Complexity 2:** TT-001, TT-008, TT-029.
+4. **Complexity 2:** TT-001, TT-008, TT-029, TT-032.
 
 ## Size ranking
 
 From largest to smallest:
 
-1. **XL:** TT-012, TT-013, TT-015 through TT-021, TT-024, TT-028.
+1. **XL:** TT-012, TT-013, TT-015 through TT-021, TT-024, TT-028, TT-033,
+   TT-034.
 2. **L:** TT-009 through TT-011, TT-022, TT-023, TT-025 through TT-027,
-   TT-030.
+   TT-030, TT-031, TT-035, TT-036.
 3. **M:** TT-004 through TT-007, TT-014, TT-029.
-4. **S:** TT-001 through TT-003, TT-008.
+4. **S:** TT-001 through TT-003, TT-008, TT-032.
 
 ## Completion checklist for each task
 
@@ -1124,8 +1433,12 @@ From largest to smallest:
 - [ ] Static analysis did not import or execute target code.
 - [ ] Evidence class and capability status are accurate.
 - [ ] Error, truncation, stale, and unsupported cases are visible.
+- [ ] Interpreter, platform, dependency, source-form, and execution-mode
+      boundaries are recorded.
 - [ ] CLI JSON remains valid and warnings remain on stderr.
 - [ ] Relevant focused tests pass.
 - [ ] The complete test suite passes offline.
-- [ ] User manual and capability audit match the implementation.
+- [ ] Every listed documentation surface was checked and updated where needed.
+- [ ] User manual, capability audit, README, and vault notes match the implementation.
+- [ ] Release/package evidence is recorded when the task changes a release claim.
 - [ ] No unrelated user changes were overwritten.

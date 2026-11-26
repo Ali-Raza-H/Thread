@@ -24,15 +24,15 @@ Every presented finding must indicate its evidence class:
 
 | Class | Meaning |
 | --- | --- |
-| Confirmed runtime observation | Directly recorded during a run. |
-| Static fact | Determined from source/project metadata. |
-| Possible or inferred relationship | A conservative analysis result; not confirmed execution. |
-| Heuristic estimate | Such as complexity or impact estimation. |
+| observed at runtime | Directly recorded during a run. |
+| statically resolved | Determined from source or project metadata. |
+| heuristically predicted | A conservative analysis result, including complexity or impact estimates; not proof of execution. |
+| unknown | ThreadTrace cannot safely infer the result. |
 | AI explanation | Generated interpretation, separate from analysis evidence. |
 
-ThreadTrace must not present an inference as observed behaviour.
-
-The v1.0 labels are **observed at runtime**, **statically resolved**, **heuristically predicted**, and **unknown**. Existing alpha labels must retain their original evidence/provenance when mapped to this model; see [[v1.0 Product Decisions#Evidence and confidence]].
+ThreadTrace must not present an inference as observed behaviour. The alpha's
+`confirmed/high/possible/unknown` values survive only in compatibility fields
+and filters; see [[v1.0 Product Decisions#Evidence and confidence]].
 
 ## Behavioural integrity
 

@@ -24,7 +24,7 @@
 ## Shared systems and interfaces
 
 1. **ThreadTrace** is the current public brand and `threadtrace` remains the CLI command. Branding is editable; any future approved rename must include a documented compatibility/migration plan.
-2. The licence is **GPL-3.0-only**. Implement the migration from the alpha's MIT metadata and account for any prior contributions.
-3. Reconciled: `0.7.0a1` is the alpha version in package metadata and user-facing documentation. [CHANGELOG.md](../../CHANGELOG.md) is the canonical release history.
+2. Reconciled: `LICENSE` contains the complete GPL-3.0-only text, and package metadata declares the same SPDX identifier.
+3. Reconciled: `0.7.0a1` is the alpha version in package metadata and user-facing documentation. The distribution, import package, and CLI command are all named `threadtrace`. [CHANGELOG.md](../../CHANGELOG.md) is the canonical release history.
 4. Implement/configure the YAML schema, keybindings, command palette, search modes, editor behaviour, browser delivery sequence, terminal fallback, and benchmark thresholds under implementation discretion.
 5. v1.0 includes the read-only loopback live server. Self-contained HTML reports are supported as exports; a native webview remains later work.

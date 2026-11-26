@@ -1,5 +1,10 @@
 
 
+> [!warning] Historical archive
+> These alpha research notes are retained for context. Current behaviour and
+> boundaries are recorded in [[Capability Audit]] and
+> [[v1.0 Product Decisions]].
+
 # 1. Dynamic analysis libraries research
 
 

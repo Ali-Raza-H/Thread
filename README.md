@@ -1,6 +1,6 @@
 # ThreadTrace
 
-ThreadTrace 0.7.0-alpha.1 is a terminal-first, local static analysis tool for Python projects. It reads source with Python's AST parser and never imports or runs the project being analysed.
+ThreadTrace 0.7.0a1 is a terminal-first, local tool for static, dynamic, and Hybrid analysis of Python projects. Only static scans never import or run the target. Runtime tracing and Hybrid experiments execute only commands you explicitly confirm in a child process, and they are not a security sandbox.
 
 See the complete [user manual](USER_MANUAL.md) for installation, every command,
 the terminal explorer, optional AI explanations, runtime-tracing safety, and
@@ -10,13 +10,17 @@ ThreadTrace is licensed under [GPL-3.0-only](LICENSE).
 See [CHANGELOG.md](CHANGELOG.md) for the canonical release history.
 
 It reconstructs evidence-backed entry points, architecture components, static
-call paths, direct argument/return flow, and external resource boundaries. A
-relationship is always labelled `confirmed`, `high`, `possible`, or `unknown`;
-ThreadTrace does not turn a dynamic Python guess into a fact.
+call paths, direct argument/return flow, and external resource boundaries.
+Every public relationship carries a versioned evidence record labelled
+`statically resolved`, `heuristically predicted`, `observed at runtime`, or
+`unknown`; ThreadTrace does not turn a dynamic Python guess into a fact. Legacy
+confidence labels survive only in compatibility fields.
 
 ## Quick start
 
-Install the development extras with `uv pip install -e ".[dev]"` to run the
+The distribution, import package, and CLI command are all named `threadtrace`;
+the product name is ThreadTrace. Install the development extras with
+`uv pip install -e ".[dev]"` to run the
 `pytest` suite. ThreadTrace is developed and tested on CPython 3.11; other
 Python versions retain their documented static-only status until they run the
 same suite.
@@ -255,5 +259,5 @@ never restores the process to an earlier state.
 
 ## Scope and limits
 
-ThreadTrace reports static evidence: definitions, imports, syntactic calls, class relationships, and local data movement. Python can select values and call targets dynamically, so uncertain calls are shown as ambiguous or unresolved rather than guessed. A data-flow view is intra-function and does not claim to track values through arbitrary runtime behaviour.
+ThreadTrace reports static evidence: definitions, imports, syntactic calls, class relationships, and local data movement. Python can select values and call targets dynamically, so uncertain calls are shown as ambiguous or unresolved rather than guessed. A data-flow view is intra-function and does not claim to track values through arbitrary runtime behaviour. Runtime tracing observes only the explicitly started child process and its instrumentable Python threads; Hybrid experiments run a private project copy with explicit confirmation. Neither mode attaches to an existing process, intercepts TLS, or provides an OS sandbox.
 

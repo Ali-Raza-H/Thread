@@ -99,9 +99,13 @@ CAPABILITY_TESTS: dict[str, tuple[str, ...]] = {
         "test_capability_manifest_names_existing_offline_tests",
         "test_scan_query_export_and_storage_gates_are_bounded",
         "test_corrupt_database_and_export_inputs_fail_cleanly",
+        "test_version_one_database_migrates_through_the_full_chain",
+        "test_version_one_export_still_imports",
+        "test_readme_quick_start_commands_execute",
     ),
     "Portable exports and read-only Python API": (
         "test_exports_share_one_version_envelope_across_formats",
+        "test_version_one_export_still_imports",
         "test_investigation_cli_and_read_only_python_api",
         "test_graph_exports_escape_project_controlled_labels",
         "test_experiment_diff_reports_every_workspace_change",

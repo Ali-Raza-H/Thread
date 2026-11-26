@@ -1,4 +1,4 @@
-"""ThreadTrace: local static analysis for Python projects."""
+"""ThreadTrace: local static, runtime, and Hybrid analysis for Python projects."""
 
 from __future__ import annotations
 

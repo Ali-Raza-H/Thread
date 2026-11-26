@@ -382,7 +382,7 @@ def _runtime_capture(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="threadtrace", description="Explore Python project structure without executing it.")
+    parser = argparse.ArgumentParser(prog="threadtrace", description="Explore Python projects with static, runtime, and Hybrid analysis.")
     parser.add_argument("--version", action="version", version=f"threadtrace {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -613,7 +613,8 @@ def build_parser() -> argparse.ArgumentParser:
     _common(overview)
     entrypoints = commands.add_parser("entrypoints", help="List detected scripts, commands, routes, workers, and tests.")
     entrypoints.add_argument("project")
-    entrypoints.add_argument("--kind", choices=("script", "module", "console", "argparse", "cli", "route", "worker", "test"))
+    entrypoints.add_argument("--kind", choices=("script", "module", "console", "argparse", "cli", "route", "worker",
+                                                  "scheduled", "middleware", "lifecycle", "plugin", "test"))
     _common(entrypoints)
     architecture = commands.add_parser("architecture", help="Show evidence-backed components and their relationships.")
     architecture.add_argument("project")

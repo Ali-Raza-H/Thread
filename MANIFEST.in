@@ -1,0 +1,3 @@
+include LICENSE README.md USER_MANUAL.md CHANGELOG.md
+prune *.egg-info
+global-exclude __pycache__ *.py[cod] .DS_Store

@@ -1,4 +1,9 @@
 
+> [!warning] Historical archive
+> This early proposal is retained for context. It is not current specification
+> or a supported command list; see [[v1.0 Product Decisions]] and
+> [[Capability Audit]].
+
 ## - What is it?
 
 Thread Trace is meant to be a powerful reverse engineering tool for any type of python program. There will be 3 core functionalities as per following:

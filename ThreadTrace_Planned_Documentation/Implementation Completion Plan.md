@@ -1016,6 +1016,8 @@ and every Partial/Unsupported claim names its tested boundary.
 
 ### TT-029 — Reconcile packaging and all documentation
 
+**Implementation status:** Complete (2026-11-26).
+
 **Goal:** Remove contradictions and make installation artifacts match the actual
 verified product.
 
@@ -1050,6 +1052,8 @@ verified product.
 help, and code report the same name, version, behaviour, limits, and licence.
 
 ### TT-030 — Run the v1 release-capability gate
+
+**Implementation status:** Complete (2026-11-26).
 
 **Goal:** Decide release readiness from evidence rather than feature labels.
 

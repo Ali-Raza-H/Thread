@@ -1,17 +1,18 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "thread-trace"
+name = "threadtrace"
 version = "0.7.0a1"
-description = "Local-first static analysis for Python projects"
+description = "Terminal-first static, dynamic, and Hybrid analysis for Python projects"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "prompt_toolkit>=3.0.43",
 ]
-license = {text = "GPL-3.0-only"}
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
 authors = [{name = "Ali Raza"}]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -32,4 +33,3 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-

@@ -1,12 +1,14 @@
 # ThreadTrace user manual
 
-ThreadTrace 0.7.0-alpha.1 is a local-first reverse-engineering tool for Python projects. It builds
-an evidence-backed model of an unfamiliar codebase without importing or running
-the project during a normal scan.
+ThreadTrace 0.7.0a1 is a local-first tool for static, dynamic, and Hybrid
+analysis of Python projects. Only static scans never import or run the target.
+Runtime tracing and Hybrid experiments execute only commands you explicitly
+confirm, and they are not a security sandbox.
 
-It can identify symbols, imports, likely entry points, components, direct call
-paths, bounded data movement, external resources, dependencies, cycles, and
-static-analysis gaps. Its optional AI feature uses a local Ollama service only.
+Static analysis identifies symbols, imports, likely entry points, components,
+direct call paths, bounded data movement, external resources, dependencies,
+cycles, and static-analysis gaps. Optional AI explanations use a local Ollama
+or OpenAI-compatible provider.
 
 ## Contents
 
@@ -19,7 +21,7 @@ static-analysis gaps. Its optional AI feature uses a local Ollama service only.
 - [Commands](#commands)
 - [Terminal explorer](#terminal-explorer)
 - [Local browser companion](#local-browser-companion)
-- [Ollama explanations](#ollama-explanations)
+- [AI explanations](#ai-explanations)
 - [Explicit runtime tracing](#explicit-runtime-tracing)
 - [Experiments](#experiments)
 - [Exports and automation](#exports-and-automation)
@@ -39,6 +41,14 @@ uv pip install -e .
 Development extras add `pytest`: `uv pip install -e ".[dev]"`. ThreadTrace is
 verified on CPython 3.11; newer CPython releases and other interpreters keep
 their documented static-only status until they pass the same automated suite.
+The distribution and import package are both named `threadtrace`, and the CLI
+command is `threadtrace`; the product name is ThreadTrace.
+
+Upgrading from an earlier alpha: the distribution name changed from
+`thread-trace` to `threadtrace`. Uninstall the old editable install
+(`uv pip uninstall thread-trace`) before reinstalling. The application
+directory remains `Thread`, so existing databases and configuration are read
+without migration.
 
 Or, using regular Python tooling:
 
@@ -63,22 +73,35 @@ The default database location follows the platform convention:
 Pass `--database PATH` to any command when you want a project-local, temporary,
 or CI-specific database.
 
+The per-user directory keeps the name `Thread` for continuity with earlier
+alpha releases; existing data is not migrated. It holds `config.yaml`,
+`thread.sqlite3`, private experiment copies, and live Host session directories.
+
 Create the optional nonsecret configuration file with:
 
 ```console
 threadtrace config init
 ```
 
-`config.yaml` is a versioned, nonsecret YAML subset (`schema_version: 1`). It
-supports `storage` (database path, retention days, trace-saving policy, quota,
-usage reporting), `discovery` include/exclude globs, `profiles.default_interpreter`,
-`tui` preferences, loopback `browser` settings, `runtime` budgets and capture,
-`exports.default_format`, and provider-independent `ai` settings (never
-credentials). Duplicate keys, unknown
-sections or fields, invalid types, secret-looking keys, and non-loopback
-browser hosts are rejected. The legacy top-level `database_path` key is still
-accepted and mapped to `storage.database_path`. Use `threadtrace config show` to
-inspect the active values and `threadtrace config path` to locate the file.
+`config.yaml` is a versioned, nonsecret YAML subset (`schema_version: 1`).
+Duplicate keys, unknown sections or fields, invalid types, secret-looking keys,
+and non-loopback browser hosts are rejected. The accepted fields and defaults
+are:
+
+| Section | Fields (default) |
+| --- | --- |
+| `storage` | `database_path` (`null`, the platform database), `retention_days` (`30`), `trace_saving` (`explicit` or `none`), `quota_mb` (`1024`), `usage_report` (`true`) |
+| `discovery` | `include` (`[]`) and `exclude` (`[]`) globs |
+| `profiles` | `default_interpreter` (`null`) |
+| `tui` | `compact` (`false`), `ascii` (`false`), `colour` (`true`), `keybindings` (`[]`) |
+| `browser` | `host` (`127.0.0.1`; `::1` is the only alternative), `port` (`0` for an ephemeral port) |
+| `runtime` | `timeout_seconds` (`30`), `output_cap` (`100000`), `capture_level` (`metadata`; `off` or `content`), `capture_limit` (`4096`) |
+| `exports` | `default_format` (`text`, `json`, `markdown`, `csv`, or `html`) |
+| `ai` | `provider` (`ollama` or `openai`), `model` (`llama3.2`), `endpoint` (`null`), `temperature` (`0.2`), `generation_limit` (`900`), `timeout_seconds` (`45`), `key_env` (`THREADTRACE_AI_API_KEY`), `template_path` (`null`), `parameters` (`[]`) |
+
+The legacy top-level `database_path` key is still accepted and mapped to
+`storage.database_path`. Use `threadtrace config show` to inspect the active
+values and `threadtrace config path` to locate the file.
 
 Per-project preferences stay in the database and override the global defaults
 for that project. Preference content is validated and merged:
@@ -255,19 +278,22 @@ Public JSON results also carry one versioned `evidence_record` with a `version`,
 | `observed at runtime` | A runtime event actually occurred or completed; attempted or unverified resources do not qualify. |
 | `unknown` | ThreadTrace cannot safely infer the result. |
 
-Older confidence labels (`confirmed`, `high`, `possible`, `unknown`) remain
-visible for compatibility and for `--confidence` filters, but they are mapped to
-the classes above. The original label is preserved in each evidence record, and
+### Legacy confidence fields
+
+The alpha's `confirmed`, `high`, `possible`, and `unknown` values remain only
+for compatibility and for `--confidence` filters, but they are mapped to the
+classes above. The original label is preserved in each evidence record, and
 scan migration records keep the historical label counts.
 
-A call is confirmed as a direct relationship only when Python binding evidence
+A call becomes a statically resolved direct relationship only when Python binding evidence
 identifies one target: a local or enclosing definition, a module definition, a
 class method reached through `self`/`cls`, an explicit import, or a re-export.
 A same-named function in another module does not count. Records expose the
 binding in the `basis` field (`lexical`, `module`, `class`, `import`,
 `re-export`, `builtin`, `shadowed`, `heuristic`, `dynamic`, or `unresolved`).
-Name-only matches are kept as `possible` candidate calls with a reason in their
-evidence, and a name shadowed by a local binding is reported as unresolved.
+Name-only matches are kept as heuristically predicted candidate calls with a
+reason in their evidence, and a name shadowed by a local binding is reported as
+unresolved.
 
 ### What a scan does
 
@@ -330,6 +356,7 @@ threadtrace lesson PROJECT SYMBOL
 
 Entry-point kinds include `script`, `module`, `console`, `argparse`, `cli`,
 `route`, `worker`, `scheduled`, `middleware`, `lifecycle`, `plugin`, and `test`.
+`--kind` accepts every one of these names.
 Entries also record their framework, declared version (when metadata provides
 one), variant, handler, inputs, limits, and capability status.
 
@@ -350,7 +377,7 @@ ThreadTrace detects conventional evidence for:
 A decorator named `.get()` or `.post()` is not a route by itself. ThreadTrace
 requires a matching framework import and a bound registration object; unrelated
 decorators remain under generic Python analysis rather than becoming
-high-confidence endpoints. Database resources distinguish DB-API, SQLAlchemy,
+high-evidence endpoints. Database resources distinguish DB-API, SQLAlchemy,
 and Django ORM calls while retaining syntax-only evidence.
 
 Resource kinds are `database`, `service`, `file`, `configuration`,
@@ -358,9 +385,9 @@ Resource kinds are `database`, `service`, `file`, `configuration`,
 `environment`, `interpreter`, `diagnostics`, `queue`, and `subprocess`.
 `http` and `env` remain aliases for `service` and `environment`; `file` also
 includes filesystem-derived path classes. Unresolved dynamic path expressions
-are retained with `possible` confidence and `unresolved` evidence. They are
-conservative recognitions of known syntactic patterns, not proof that an
-external operation completed.
+are retained as heuristically predicted with explicit `unresolved` evidence.
+They are conservative recognitions of known syntactic patterns, not proof that
+an external operation completed.
 
 `lesson` is a local, deterministic teaching card for one function, method, or
 class. It combines purpose, source range, inputs/outputs, direct calls, callers,
@@ -390,8 +417,9 @@ threadtrace advanced PROJECT SYMBOL
 
 `path` begins at a detected entry point and follows resolved calls. It stops at
 the selected depth, recursion, unresolved/dynamic boundaries, or external
-resources. Use `--confidence confirmed` to hide inferred branches, or
-`--confidence possible` for the normal balanced view.
+resources. Use `--confidence confirmed` (the legacy high-evidence filter) to
+hide inferred branches, or `--confidence possible` (the default) for the normal
+balanced view.
 
 `impact` labels both directions through calls, import dependants, inheritance
 users, resolved references, configured entry points, and affected resources.
@@ -1292,7 +1320,7 @@ threadtrace investigation list example-api
 threadtrace investigation show example-api auth-flow
 threadtrace investigation resume example-api auth-flow
 threadtrace investigation export example-api auth-flow --output auth-flow.json
-threadtrace investigation import example-api auth-flow.json --name auth-flow copy
+threadtrace investigation import example-api auth-flow.json --name "auth-flow copy"
 ```
 
 An investigation stores `files`, `symbols`, `events`, `notes`, `hypotheses`,
@@ -1410,6 +1438,42 @@ Deletion output lists removed and preserved experiment workspaces. Project
 removal does not delete the SQLite database if it contains other projects, and
 no delete command removes registered source files.
 
+### Data locations, permissions, and confirmations
+
+ThreadTrace keeps all local state under the application directory shown above:
+
+| Data | Location | Retention and deletion |
+| --- | --- | --- |
+| Database | `Thread/thread.sqlite3`, or the `--database PATH` you choose | Scans, traces, reports, AI exchanges, and investigations persist until `storage --prune`, `delete`, or `project remove`. |
+| Configuration | `Thread/config.yaml` | Nonsecret only; `config init --force` replaces it. |
+| AI credential file | `Thread/.env` | Optional mode-0600 fallback; delete it to revoke the credential. |
+| Experiment copies | Private workspaces under `Thread/` | Removed with `experiment remove --yes`, `project remove`, or `delete all`. |
+| Live sessions | `Thread/threadtrace-live-*` | Removed when the host exits or after 24 hours. |
+| Exports | The `--output` path you choose | Never deleted automatically. |
+
+Directories are created mode 0700, and the database, configuration, exports,
+and Unix socket are mode 0600 where the platform supports POSIX permissions.
+Retention defaults to 30 days; pruning is always explicit and keeps each
+project's newest completed scan.
+
+Commands that can execute code, delete data, or persist unredacted values ask
+for a specific confirmation:
+
+| Action | Confirmation |
+| --- | --- |
+| Trace, Runtime Host, profile run, or experiment run/call/compare/explore/replay | `--yes-run` (Runtime and experiment dashboards also ask before starting) |
+| Process restart | The confirmation screen; the selected PID's start-time token is checked |
+| Unredacted local capture | `--no-redact` together with `--yes-sensitive` |
+| Delete a project, trace, report, or all data; remove an experiment | `--yes` |
+| Remote AI request | Matching SHA-256 digest (`--ai-approve`) or an interactive `approve` |
+| Source edit in the explorer | Read-only diff followed by an explicit `y` or `Enter` |
+
+Unsupported v1 boundaries: attaching to an existing process, Host/Listener IPC
+on Windows, TLS or packet interception, source-free or bytecode-only projects,
+sensitive-data taint analysis, and runtime tracing on interpreters other than
+the verified CPython 3.11 release. Static parsing remains available for other
+CPython versions, but it is not verified there.
+
 Database migrations are backed up to `threadtrace.sqlite3.bak` before an older
 schema is upgraded. A failed migration restores the backup. The database file,
 configuration file, exports, and live session directories use restrictive
@@ -1429,12 +1493,13 @@ include the same change report and patch history.
 
 ThreadTrace is designed to be conservative.
 
-- It does not execute source code during ordinary scanning.
+- Only static scans never import or run the target. Explicit Runtime, Host,
+  process restart, and Hybrid commands execute target code after confirmation.
 - It does not claim certainty for dynamic Python features such as `eval`,
   `getattr`, monkey patching, dynamic imports, plugins, and metaprogramming.
 - It records dynamic boundaries as findings instead of making up call edges.
 - Framework detection covers common static conventions; unusual registration
-  patterns may be `possible`, `unknown`, or absent.
+  patterns may be heuristically predicted, unknown, or absent.
 - Data-flow reconstruction covers direct resolved calls and returns only.
 - Resource detection recognises common calls and imports; it does not prove a
   database write, request, or subprocess call succeeded at runtime.
